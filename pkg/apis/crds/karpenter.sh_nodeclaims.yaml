@@ -387,6 +387,54 @@ spec:
                 providerID:
                   description: ProviderID of the corresponding node object
                   type: string
+                repairAttempt:
+                  description: repairAttempt records the committed in-place repair for this NodeClaim.
+                  properties:
+                    action:
+                      description: action is the repair operation committed for this attempt.
+                      enum:
+                        - RebootNode
+                      type: string
+                    committedAt:
+                      description: committedAt is when the repair crossed its durable commitment boundary.
+                      format: date-time
+                      type: string
+                    drivingConditionStatus:
+                      description: drivingConditionStatus is the admitted status of the driving condition.
+                      enum:
+                        - "True"
+                        - "False"
+                        - Unknown
+                      type: string
+                    drivingConditionType:
+                      description: drivingConditionType identifies the condition that selected the action.
+                      type: string
+                    drivingReason:
+                      description: drivingReason is the admitted reason of the driving condition.
+                      type: string
+                    nodeUID:
+                      description: nodeUID identifies the Node that supplied the admitted health evidence.
+                      type: string
+                    operationID:
+                      description: operationID identifies the logical provider operation across retries.
+                      minLength: 1
+                      type: string
+                    resolvedAt:
+                      description: resolvedAt is when the repair reached a terminal outcome.
+                      format: date-time
+                      type: string
+                    terminationGracePeriod:
+                      description: terminationGracePeriod is the drain bound fixed at commitment.
+                      type: string
+                  required:
+                    - action
+                    - committedAt
+                    - drivingConditionStatus
+                    - drivingConditionType
+                    - drivingReason
+                    - nodeUID
+                    - operationID
+                  type: object
               type: object
           required:
             - spec
