@@ -69,6 +69,22 @@ const (
 	ReplaceNode RepairAction = "ReplaceNode"
 )
 
+// IsMoreDisruptiveThan returns whether the repair action is more disruptive than another action.
+func (a RepairAction) IsMoreDisruptiveThan(other RepairAction) bool {
+	return repairActionRank(a) > repairActionRank(other)
+}
+
+func repairActionRank(action RepairAction) int {
+	switch action {
+	case ReplaceNode:
+		return 1
+	case RebootNode:
+		return 0
+	default:
+		return -1
+	}
+}
+
 // RepairPolicy defines when and how Karpenter repairs a provider-supported unhealthy condition.
 type RepairPolicy struct {
 	// ConditionType identifies the NodeCondition to evaluate.

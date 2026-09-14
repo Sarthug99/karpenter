@@ -17,21 +17,23 @@ limitations under the License.
 package repair
 
 import (
-	"slices"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
-	"sigs.k8s.io/karpenter/pkg/controllers/node/health"
 )
 
 // Result combines one eligible reason-matching result with its resolved drain bound.
 type Result struct {
-	health.RepairPolicyResult
+	ConditionType   corev1.NodeConditionType
+	ConditionStatus corev1.ConditionStatus
+	Reason          string
+	Action          cloudprovider.RepairAction
+	EligibleAt      time.Time
+
 	TerminationGracePeriod *time.Duration
 }
 
@@ -52,26 +54,33 @@ type Candidate struct {
 	Action           cloudprovider.RepairAction
 	EligibleAt       time.Time
 	DrivingCondition Condition
+	RebootEscalated  bool
 
 	TerminationGracePeriod          *time.Duration
 	TerminationGracePeriodCondition *Condition
 }
 
-// ResolveActions applies durable attempt history to current eligible results.
-func ResolveActions(results []Result, attempt *v1.RepairAttemptStatus) []Result {
-	if len(results) == 0 || (attempt != nil && attempt.ResolvedAt == nil) {
-		return nil
+// LogValues returns structured values describing the resolved candidate.
+func (c *Candidate) LogValues() []any {
+	values := []any{
+		"action", c.Action,
+		"eligible-at", c.EligibleAt,
+		"condition", c.DrivingCondition.Type,
+		"status", c.DrivingCondition.Status,
+		"reason", c.DrivingCondition.Reason,
+		"reboot-escalated", c.RebootEscalated,
 	}
-	if attempt == nil {
-		return results
+	if c.TerminationGracePeriod != nil {
+		values = append(values, "termination-grace-period", *c.TerminationGracePeriod)
 	}
-	resolved := slices.Clone(results)
-	for i := range resolved {
-		if resolved[i].Action == cloudprovider.RebootNode {
-			resolved[i].Action = cloudprovider.ReplaceNode
-		}
+	if c.TerminationGracePeriodCondition != nil && *c.TerminationGracePeriodCondition != c.DrivingCondition {
+		values = append(values,
+			"termination-grace-period-condition", c.TerminationGracePeriodCondition.Type,
+			"termination-grace-period-status", c.TerminationGracePeriodCondition.Status,
+			"termination-grace-period-reason", c.TerminationGracePeriodCondition.Reason,
+		)
 	}
-	return resolved
+	return values
 }
 
 // ResolveCandidate deterministically combines action-resolved results.
@@ -112,7 +121,7 @@ func ResolveCandidate(node *corev1.Node, nodeClaim *v1.NodeClaim, results []Resu
 func selectAction(results []Result) cloudprovider.RepairAction {
 	action := results[0].Action
 	for _, result := range results[1:] {
-		if actionRank(result.Action) > actionRank(action) {
+		if result.Action.IsMoreDisruptiveThan(action) {
 			action = result.Action
 		}
 	}
@@ -144,27 +153,6 @@ func selectDrainBoundResult(results []Result) *Result {
 	return drainBound
 }
 
-// NewRepairAttempt creates the durable repair attempt for an admitted reboot candidate.
-// It returns nil for absent and replacement candidates.
-func NewRepairAttempt(candidate *Candidate, operationID string, committedAt time.Time) *v1.RepairAttemptStatus {
-	if candidate == nil || candidate.Action != cloudprovider.RebootNode {
-		return nil
-	}
-	attempt := &v1.RepairAttemptStatus{
-		Action:                 v1.RepairAttemptActionRebootNode,
-		OperationID:            operationID,
-		NodeUID:                candidate.NodeUID,
-		CommittedAt:            metav1.NewTime(committedAt),
-		DrivingConditionType:   candidate.DrivingCondition.Type,
-		DrivingConditionStatus: candidate.DrivingCondition.Status,
-		DrivingReason:          candidate.DrivingCondition.Reason,
-	}
-	if candidate.TerminationGracePeriod != nil {
-		attempt.TerminationGracePeriod = &metav1.Duration{Duration: *candidate.TerminationGracePeriod}
-	}
-	return attempt
-}
-
 func resultLess(lhs, rhs Result) bool {
 	if !lhs.EligibleAt.Equal(rhs.EligibleAt) {
 		return lhs.EligibleAt.Before(rhs.EligibleAt)
@@ -176,15 +164,4 @@ func resultLess(lhs, rhs Result) bool {
 		return lhs.ConditionStatus < rhs.ConditionStatus
 	}
 	return lhs.Reason < rhs.Reason
-}
-
-func actionRank(action cloudprovider.RepairAction) int {
-	switch action {
-	case cloudprovider.ReplaceNode:
-		return 1
-	case cloudprovider.RebootNode:
-		return 0
-	default:
-		return -1
-	}
 }

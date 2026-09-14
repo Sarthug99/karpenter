@@ -17,7 +17,6 @@ limitations under the License.
 package repair
 
 import (
-	"encoding/json"
 	"slices"
 	"time"
 
@@ -29,44 +28,9 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
-	"sigs.k8s.io/karpenter/pkg/controllers/node/health"
 )
 
 var _ = Describe("Resolver", func() {
-	Describe("ResolveActions", func() {
-		var results []Result
-
-		BeforeEach(func() {
-			results = []Result{
-				repairResult("AcceleratorReady", corev1.ConditionFalse, "XID48", cloudprovider.RebootNode, time.Unix(1, 0), nil),
-				repairResult("StorageReady", corev1.ConditionFalse, "DiskFailure", cloudprovider.ReplaceNode, time.Unix(2, 0), nil),
-			}
-		})
-
-		It("keeps current actions when no attempt exists", func() {
-			Expect(ResolveActions(results, nil)).To(Equal(results))
-		})
-
-		It("suppresses results while an attempt is unresolved", func() {
-			Expect(ResolveActions(results, &v1.RepairAttemptStatus{})).To(BeNil())
-		})
-
-		It("escalates reboot results after an attempt resolves without mutating the input", func() {
-			resolvedAt := metav1.NewTime(time.Unix(3, 0))
-			resolved := ResolveActions(results, &v1.RepairAttemptStatus{ResolvedAt: &resolvedAt})
-			expected := slices.Clone(results)
-			expected[0].Action = cloudprovider.ReplaceNode
-
-			Expect(resolved).To(Equal(expected))
-			Expect(results[0].Action).To(Equal(cloudprovider.RebootNode))
-		})
-
-		It("returns no results when there is no current eligible evidence", func() {
-			resolvedAt := metav1.NewTime(time.Unix(3, 0))
-			Expect(ResolveActions(nil, &v1.RepairAttemptStatus{ResolvedAt: &resolvedAt})).To(BeNil())
-		})
-	})
-
 	Describe("ResolveCandidate", func() {
 		It("combines all results deterministically", func() {
 			node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node", UID: types.UID("node-uid")}}
@@ -93,6 +57,18 @@ var _ = Describe("Resolver", func() {
 			Expect(*candidate.TerminationGracePeriod).To(Equal(time.Minute))
 			Expect(candidate.TerminationGracePeriodCondition).To(Equal(&Condition{
 				Type: corev1.NodeConditionType("AcceleratorReady"), Status: corev1.ConditionFalse, Reason: "XID48",
+			}))
+			Expect(candidate.LogValues()).To(Equal([]any{
+				"action", cloudprovider.ReplaceNode,
+				"eligible-at", time.Unix(2, 0),
+				"condition", corev1.NodeConditionType("StorageReady"),
+				"status", corev1.ConditionFalse,
+				"reason", "DiskFailure",
+				"reboot-escalated", false,
+				"termination-grace-period", time.Minute,
+				"termination-grace-period-condition", corev1.NodeConditionType("AcceleratorReady"),
+				"termination-grace-period-status", corev1.ConditionFalse,
+				"termination-grace-period-reason", "XID48",
 			}))
 
 			for _, order := range [][]int{
@@ -158,10 +134,6 @@ var _ = Describe("Resolver", func() {
 			Expect(candidate.TerminationGracePeriod).NotTo(BeNil())
 			Expect(*candidate.TerminationGracePeriod).To(BeZero())
 			Expect(candidate.TerminationGracePeriodCondition.Type).To(Equal(corev1.NodeConditionType("StorageReady")))
-
-			attempt := NewRepairAttempt(candidate, "operation-id", time.Unix(3, 0))
-			Expect(attempt.TerminationGracePeriod).NotTo(BeNil())
-			Expect(attempt.TerminationGracePeriod.Duration).To(BeZero())
 		})
 
 		It("selects the drain-bound contributor deterministically", func() {
@@ -183,64 +155,6 @@ var _ = Describe("Resolver", func() {
 			Expect(ResolveCandidate(&corev1.Node{}, &v1.NodeClaim{}, reversed)).To(Equal(candidate))
 		})
 	})
-
-	Describe("NewRepairAttempt", func() {
-		var candidate *Candidate
-		var committedAt time.Time
-		var terminationGracePeriod time.Duration
-
-		BeforeEach(func() {
-			committedAt = time.Unix(10, 0)
-			terminationGracePeriod = 2 * time.Minute
-			candidate = &Candidate{
-				NodeUID: types.UID("node-uid"),
-				Action:  cloudprovider.RebootNode,
-				DrivingCondition: Condition{
-					Type: corev1.NodeConditionType("AcceleratorReady"), Status: corev1.ConditionFalse, Reason: "XID48",
-				},
-				TerminationGracePeriod: &terminationGracePeriod,
-			}
-		})
-
-		It("snapshots an admitted reboot candidate", func() {
-			attempt := NewRepairAttempt(candidate, "operation-id", committedAt)
-			Expect(attempt).To(Equal(&v1.RepairAttemptStatus{
-				Action:                 v1.RepairAttemptActionRebootNode,
-				OperationID:            "operation-id",
-				NodeUID:                types.UID("node-uid"),
-				CommittedAt:            metav1.NewTime(committedAt),
-				DrivingConditionType:   corev1.NodeConditionType("AcceleratorReady"),
-				DrivingConditionStatus: corev1.ConditionFalse,
-				DrivingReason:          "XID48",
-				TerminationGracePeriod: &metav1.Duration{Duration: 2 * time.Minute},
-			}))
-
-			terminationGracePeriod = 3 * time.Minute
-			Expect(attempt.TerminationGracePeriod.Duration).To(Equal(2 * time.Minute))
-		})
-
-		It("does not create attempts for absent or replacement candidates", func() {
-			Expect(NewRepairAttempt(nil, "operation-id", committedAt)).To(BeNil())
-			candidate.Action = cloudprovider.ReplaceNode
-			Expect(NewRepairAttempt(candidate, "operation-id", committedAt)).To(BeNil())
-		})
-
-		It("preserves an unbounded drain window", func() {
-			candidate.TerminationGracePeriod = nil
-			Expect(NewRepairAttempt(candidate, "operation-id", committedAt).TerminationGracePeriod).To(BeNil())
-		})
-
-		It("serializes an empty driving reason", func() {
-			candidate.DrivingCondition.Reason = ""
-			attempt := NewRepairAttempt(candidate, "operation-id", committedAt)
-
-			data, err := json.Marshal(attempt)
-			Expect(err).NotTo(HaveOccurred())
-			fields := map[string]json.RawMessage{}
-			Expect(json.Unmarshal(data, &fields)).To(Succeed())
-			Expect(fields).To(HaveKeyWithValue("drivingReason", json.RawMessage(`""`)))
-		})
-	})
 })
 
 func repairResult(
@@ -252,9 +166,7 @@ func repairResult(
 	terminationGracePeriod *time.Duration,
 ) Result {
 	return Result{
-		RepairPolicyResult: health.RepairPolicyResult{
-			ConditionType: conditionType, ConditionStatus: conditionStatus, Reason: reason, Action: action, EligibleAt: eligibleAt,
-		},
+		ConditionType: conditionType, ConditionStatus: conditionStatus, Reason: reason, Action: action, EligibleAt: eligibleAt,
 		TerminationGracePeriod: terminationGracePeriod,
 	}
 }
