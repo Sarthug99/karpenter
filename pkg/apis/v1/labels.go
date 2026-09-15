@@ -53,6 +53,11 @@ const (
 	NodePoolHashVersionAnnotationKey           = apis.Group + "/nodepool-hash-version"
 	NodeClaimTerminationTimestampAnnotationKey = apis.Group + "/nodeclaim-termination-timestamp"
 	NodeClaimMinValuesRelaxedAnnotationKey     = apis.Group + "/nodeclaim-min-values-relaxed"
+	RebootOperationIDAnnotationKey             = apis.Group + "/reboot-operation-id"
+	RebootPreBootIDAnnotationKey               = apis.Group + "/reboot-pre-boot-id"
+	RebootRequestedAtAnnotationKey             = apis.Group + "/reboot-requested-at"
+	RebootIssuedAtAnnotationKey                = apis.Group + "/reboot-issued-at"
+	RebootDrainGracePeriodAnnotationKey        = apis.Group + "/reboot-drain-grace-period"
 	// DRADriversAnnotationKey records the comma-separated set of DRA driver names whose devices were allocated to pods
 	// scheduled to this NodeClaim. The initialization controller can gate on these drivers having published their
 	// ResourceSlices before marking the node initialized.
