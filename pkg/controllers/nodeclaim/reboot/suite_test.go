@@ -158,7 +158,7 @@ var _ = Describe("Reboot Lifecycle", func() {
 		It("retries on a transient provider error, staying in RebootRequested", func() {
 			cloudProvider.NextRebootErr = fmt.Errorf("throttled")
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
-			ExpectObjectReconcileFailed(ctx, env.Client, rebootController, nodeClaim)
+			_ = ExpectObjectReconcileFailed(ctx, env.Client, rebootController, nodeClaim)
 
 			Expect(cloudProvider.RebootCalls).To(BeEmpty())
 			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
