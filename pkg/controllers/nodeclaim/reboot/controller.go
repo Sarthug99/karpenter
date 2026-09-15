@@ -43,6 +43,7 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/node/termination/terminator"
+	rebootevents "sigs.k8s.io/karpenter/pkg/controllers/nodeclaim/reboot/events"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
@@ -118,6 +119,11 @@ func (c *Controller) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (re
 
 // reconcileRequested applies the scheduling fence, drains (bounded), then issues the provider reboot.
 func (c *Controller) reconcileRequested(ctx context.Context, nodeClaim *v1.NodeClaim, node *corev1.Node) (reconcile.Result, error) {
+	c.recorder.Publish(rebootevents.Requested(nodeClaim))
+	// Stamp the request time (the total-duration metric's start) before draining.
+	if err := c.ensureRequestedAt(ctx, nodeClaim); err != nil {
+		return reconcile.Result{}, err
+	}
 	// Scheduling fence: reboot-owned taint that keeps evicted pods from rescheduling onto the pre-reboot boot.
 	if err := c.ensureRebootTaint(ctx, node); err != nil {
 		return reconcile.Result{}, err
@@ -145,7 +151,7 @@ func (c *Controller) reconcileRequested(ctx context.Context, nodeClaim *v1.NodeC
 	operationID := nodeClaim.Annotations[v1.RebootOperationIDAnnotationKey]
 	if err := c.cloudProvider.Reboot(ctx, nodeClaim, operationID); err != nil {
 		if cloudprovider.IsNodeRebootNotImplementedError(err) {
-			return c.transitionToFailed(ctx, nodeClaim, node, "reboot not implemented by the cloud provider")
+			return c.transitionToFailed(ctx, nodeClaim, node, resultProviderError, "reboot not implemented by the cloud provider")
 		}
 		// Transient error: stay in RebootRequested and retry with backoff using the same operationID.
 		return reconcile.Result{}, fmt.Errorf("issuing reboot, %w", err)
@@ -165,6 +171,7 @@ func (c *Controller) reconcileIssued(ctx context.Context, nodeClaim *v1.NodeClai
 		if err := c.removeRebootTaint(ctx, node); err != nil {
 			return reconcile.Result{}, err
 		}
+		c.recorder.Publish(rebootevents.Observed(nodeClaim))
 	}
 
 	ready := nodeutils.GetCondition(node, corev1.NodeReady).Status == corev1.ConditionTrue
@@ -173,7 +180,7 @@ func (c *Controller) reconcileIssued(ctx context.Context, nodeClaim *v1.NodeClai
 	}
 
 	if issuedAt, ok := c.issuedAt(nodeClaim); ok && c.clock.Since(issuedAt) > observationWindow {
-		return c.transitionToFailed(ctx, nodeClaim, node, "node did not recover within observation window")
+		return c.transitionToFailed(ctx, nodeClaim, node, resultRecoveryTimeout, "node did not recover within observation window")
 	}
 	return reconcile.Result{RequeueAfter: pollInterval}, nil
 }
@@ -232,6 +239,7 @@ func (c *Controller) transitionToIssued(ctx context.Context, nodeClaim *v1.NodeC
 	if err := c.removeInitializedLabel(ctx, node); err != nil {
 		return reconcile.Result{}, err
 	}
+	c.recorder.Publish(rebootevents.Issued(nodeClaim))
 	return reconcile.Result{RequeueAfter: pollInterval}, nil
 }
 
@@ -239,14 +247,22 @@ func (c *Controller) transitionToSucceeded(ctx context.Context, nodeClaim *v1.No
 	if err := c.removeRebootTaint(ctx, node); err != nil {
 		return reconcile.Result{}, err
 	}
+	c.recorder.Publish(rebootevents.Succeeded(nodeClaim))
+	c.recordTerminalMetrics(nodeClaim, resultSucceeded)
+	// Recovery duration (drain-independent): issuance -> new boot rejoined. Success only.
+	if issuedAt, ok := c.issuedAt(nodeClaim); ok {
+		RebootRecoveryDurationSeconds.Observe(c.clock.Since(issuedAt).Seconds(), map[string]string{})
+	}
 	return c.setTerminal(ctx, nodeClaim, v1.RebootReasonSucceeded, "node rebooted and rejoined the cluster")
 }
 
-func (c *Controller) transitionToFailed(ctx context.Context, nodeClaim *v1.NodeClaim, node *corev1.Node, msg string) (reconcile.Result, error) {
+func (c *Controller) transitionToFailed(ctx context.Context, nodeClaim *v1.NodeClaim, node *corev1.Node, result, msg string) (reconcile.Result, error) {
 	// Terminal cleanup: ensure the reboot-owned fence is removed even if the boot never changed.
 	if err := c.removeRebootTaint(ctx, node); err != nil {
 		return reconcile.Result{}, err
 	}
+	c.recorder.Publish(rebootevents.Failed(nodeClaim, msg))
+	c.recordTerminalMetrics(nodeClaim, result)
 	return c.setTerminal(ctx, nodeClaim, v1.RebootReasonFailed, msg)
 }
 
@@ -303,4 +319,25 @@ func (c *Controller) issuedAt(nodeClaim *v1.NodeClaim) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	return t, true
+}
+
+// ensureRequestedAt stamps the reboot request time (the Rebooting condition's transition) once, so the
+// total-duration metric can measure request -> terminal across drain, issue, and observe.
+func (c *Controller) ensureRequestedAt(ctx context.Context, nodeClaim *v1.NodeClaim) error {
+	if _, ok := nodeClaim.Annotations[v1.RebootRequestedAtAnnotationKey]; ok {
+		return nil
+	}
+	requestedAt := nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).LastTransitionTime.Time
+	stored := nodeClaim.DeepCopy()
+	nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{v1.RebootRequestedAtAnnotationKey: requestedAt.Format(time.RFC3339)})
+	return c.kubeClient.Patch(ctx, nodeClaim, client.MergeFrom(stored))
+}
+
+// recordTerminalMetrics counts the reboot by result and observes the full-action duration (request ->
+// terminal), on every terminal outcome.
+func (c *Controller) recordTerminalMetrics(nodeClaim *v1.NodeClaim, result string) {
+	RebootsTotal.Inc(map[string]string{resultLabel: result})
+	if requestedAt, err := time.Parse(time.RFC3339, nodeClaim.Annotations[v1.RebootRequestedAtAnnotationKey]); err == nil {
+		RebootDurationSeconds.Observe(c.clock.Since(requestedAt).Seconds(), map[string]string{resultLabel: result})
+	}
 }
