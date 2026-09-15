@@ -46,8 +46,8 @@ import (
 	rebootevents "sigs.k8s.io/karpenter/pkg/controllers/nodeclaim/reboot/events"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
-	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
+	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
 )
 
 const (
@@ -222,16 +222,21 @@ func (c *Controller) recordIssuingState(ctx context.Context, nodeClaim *v1.NodeC
 }
 
 func (c *Controller) transitionToIssued(ctx context.Context, nodeClaim *v1.NodeClaim, node *corev1.Node) (reconcile.Result, error) {
+	// Stamp issued-at (metadata) first, then flip conditions (status) from a fresh snapshot: each patch's
+	// server response overwrites the in-memory object, so a single shared snapshot would clobber the other.
 	stored := nodeClaim.DeepCopy()
 	nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{v1.RebootIssuedAtAnnotationKey: c.clock.Now().Format(time.RFC3339)})
+	if !equality.Semantic.DeepEqual(stored, nodeClaim) {
+		if err := c.kubeClient.Patch(ctx, nodeClaim, client.MergeFrom(stored)); err != nil {
+			return reconcile.Result{}, err
+		}
+	}
+	stored = nodeClaim.DeepCopy()
 	nodeClaim.StatusConditions().SetTrueWithReason(v1.ConditionTypeRebooting, v1.RebootReasonIssued, "reboot issued to the provider")
 	// Initialization is scoped to a boot; a committed reboot invalidates it until the node re-initializes.
 	nodeClaim.StatusConditions().SetUnknownWithReason(v1.ConditionTypeInitialized, v1.RebootReasonRequested, "node is rebooting")
 	if !equality.Semantic.DeepEqual(stored, nodeClaim) {
 		if err := c.kubeClient.Status().Patch(ctx, nodeClaim, client.MergeFrom(stored)); err != nil {
-			return reconcile.Result{}, err
-		}
-		if err := c.kubeClient.Patch(ctx, nodeClaim, client.MergeFrom(stored)); err != nil {
 			return reconcile.Result{}, err
 		}
 	}
