@@ -34,6 +34,17 @@ const (
 	resultRecoveryTimeout = "recovery_timeout"
 )
 
+// Result is the terminal-outcome dimension shared by every reboot metric.
+var Result = opmetrics.Label{
+	Name: resultLabel,
+	Help: "The terminal outcome of the reboot.",
+	Values: []opmetrics.Value{
+		{Name: resultSucceeded, Help: "The node rebooted and rejoined the cluster (bootID changed + Ready)."},
+		{Name: resultProviderError, Help: "The cloud provider rejected the reboot with a terminal error."},
+		{Name: resultRecoveryTimeout, Help: "The node did not prove a new boot and rejoin within the observation window."},
+	},
+}
+
 // rebootDurationBuckets span a few seconds to past the observation window (~21m), covering fast VMs
 // through slow bare-metal reboots.
 var rebootDurationBuckets = prometheus.ExponentialBuckets(10, 2, 8) // 10,20,40,80,160,320,640,1280s
@@ -47,7 +58,7 @@ var (
 			Name:      "reboots_total",
 			Help:      "Number of node reboots carried out by Karpenter, labeled by terminal result (succeeded, provider_error, recovery_timeout).",
 		},
-		[]string{resultLabel},
+		[]opmetrics.Label{Result},
 	)
 	// RebootDurationSeconds measures the whole reboot action: RebootRequested through the terminal
 	// outcome (includes fence + drain + issue + observe).
@@ -60,7 +71,7 @@ var (
 			Help:      "Duration of the full reboot action from request to terminal outcome, labeled by result.",
 			Buckets:   rebootDurationBuckets,
 		},
-		[]string{resultLabel},
+		[]opmetrics.Label{Result},
 	)
 	// RebootRecoveryDurationSeconds measures pure reboot-to-recovery: issuance to a new boot rejoining
 	// (bootID changed + Ready). Drain-independent; recorded only on success. This is the signal used to
@@ -74,6 +85,6 @@ var (
 			Help:      "Time from issuing a reboot until the node proved a new boot and rejoined (bootID changed + Ready). Recorded on successful reboots only.",
 			Buckets:   rebootDurationBuckets,
 		},
-		[]string{},
+		[]opmetrics.Label{},
 	)
 )
