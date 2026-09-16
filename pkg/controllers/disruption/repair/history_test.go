@@ -62,6 +62,14 @@ var _ = Describe("RebootHistory", func() {
 		Expect(candidate.Action).To(Equal(cloudprovider.RebootNode))
 	})
 
+	It("resolves current results without committing or recording history", func() {
+		candidate := history.Resolve(node, nodeClaim, false, rebootResults)
+		Expect(candidate.Action).To(Equal(cloudprovider.RebootNode))
+
+		candidate = history.Resolve(node, nodeClaim, false, rebootResults)
+		Expect(candidate.Action).To(Equal(cloudprovider.RebootNode))
+	})
+
 	It("suppresses every action from active history before the lifecycle is observed", func() {
 		admit(history, node, nodeClaim, false, rebootResults)
 

@@ -33,8 +33,11 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
+	"sigs.k8s.io/karpenter/pkg/controllers/dynamicresources/deviceallocation"
+	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	karpenterevents "sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
+	"sigs.k8s.io/karpenter/pkg/state/virtualpods"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
@@ -68,6 +71,19 @@ type terminationTimestampPatchErrorClient struct {
 	client.Client
 	err      error
 	failNext bool
+}
+
+type podListHookClient struct {
+	client.Client
+	once sync.Once
+	hook func()
+}
+
+func (c *podListHookClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if _, ok := list.(*corev1.PodList); ok {
+		c.once.Do(c.hook)
+	}
+	return c.Client.List(ctx, list, opts...)
 }
 
 func (c *terminationTimestampPatchErrorClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
@@ -342,6 +358,40 @@ var _ = Describe("Repair", func() {
 
 		ExpectSingletonReconciled(ctx, repairController)
 		Expect(queue.GetCommands()).To(HaveLen(1))
+	})
+
+	It("should resolve multiple eligible conditions into one command with the shortest drain bound", func() {
+		cloudProvider.RepairPolicy = []cloudprovider.RepairPolicy{
+			{
+				ConditionType:          "BadNode",
+				ConditionStatus:        corev1.ConditionFalse,
+				TolerationDuration:     30 * time.Minute,
+				TerminationGracePeriod: lo.ToPtr(10 * time.Minute),
+				Action:                 cloudprovider.ReplaceNode,
+			},
+			{
+				ConditionType:          "WorseNode",
+				ConditionStatus:        corev1.ConditionFalse,
+				ReasonRegex:            ".*",
+				TolerationDuration:     5 * time.Minute,
+				TerminationGracePeriod: lo.ToPtr(2 * time.Minute),
+				Action:                 cloudprovider.ReplaceNode,
+			},
+		}
+		newRepairController()
+		initNode(nodeClaim, node)
+		bindReschedulablePod(node)
+		markUnhealthyWithReason(node, "BadNode", "Persistent")
+		env.Clock.Step(25 * time.Minute)
+		markUnhealthyWithReason(node, "WorseNode", "Urgent")
+		env.Clock.Step(6 * time.Minute)
+
+		ExpectSingletonReconciled(ctx, repairController)
+
+		cmds := queue.GetCommands()
+		Expect(cmds).To(HaveLen(1))
+		Expect(cmds[0].Candidates[0].TerminationGracePeriod).NotTo(BeNil())
+		Expect(*cmds[0].Candidates[0].TerminationGracePeriod).To(Equal(2 * time.Minute))
 	})
 
 	// INV-S7: a replacement that does not initialize (bad AMI / partitioned zone) never leads to terminating the
@@ -762,6 +812,61 @@ var _ = Describe("Repair", func() {
 		Expect(cmds[0].Replacements[0].IsStaticNodeClaim).To(BeTrue())
 	})
 
+	It("should reject a static replacement when the resolved condition changes before reservation", func() {
+		cloudProvider.RepairPolicy = []cloudprovider.RepairPolicy{
+			{
+				ConditionType:          "BadNode",
+				ConditionStatus:        corev1.ConditionFalse,
+				TolerationDuration:     30 * time.Minute,
+				TerminationGracePeriod: lo.ToPtr(10 * time.Minute),
+				Action:                 cloudprovider.ReplaceNode,
+			},
+			{
+				ConditionType:          "WorseNode",
+				ConditionStatus:        corev1.ConditionFalse,
+				ReasonRegex:            ".*",
+				TolerationDuration:     5 * time.Minute,
+				TerminationGracePeriod: lo.ToPtr(2 * time.Minute),
+				Action:                 cloudprovider.ReplaceNode,
+			},
+		}
+		nodePool = test.StaticNodePool(v1.NodePool{
+			Spec: v1.NodePoolSpec{
+				Replicas: lo.ToPtr[int64](5),
+				Limits:   v1.Limits{resources.Node: resource.MustParse("6")},
+				Disruption: v1.Disruption{
+					Budgets: []v1.Budget{{Nodes: "100%"}},
+				},
+			},
+		})
+		ExpectApplied(ctx, env.Client, nodePool)
+		newRepairController()
+		nodeClaims, nodes := test.NodeClaimsAndNodes(5, v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: labels()}})
+		for i := range nodes {
+			initNode(nodeClaims[i], nodes[i])
+		}
+		markUnhealthy(nodes[0], "BadNode")
+		markUnhealthy(nodes[0], "WorseNode")
+		env.Clock.Step(31 * time.Minute)
+
+		candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, env.Clock, cloudProvider, repair.ShouldDisrupt, disruption.RepairDisruptionClass, queue)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(candidates).To(HaveLen(1))
+
+		current := ExpectExists(ctx, env.Client, nodes[0])
+		current.Status.Conditions = lo.Reject(current.Status.Conditions, func(condition corev1.NodeCondition, _ int) bool {
+			return condition.Type == "WorseNode"
+		})
+		ExpectApplied(ctx, env.Client, current)
+		ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(current))
+
+		commands, err := repair.ComputeCommands(ctx, map[string]int{nodePool.Name: 1}, candidates...)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(commands).To(BeEmpty())
+		Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 6, 1)).To(Equal(int64(1)))
+		cluster.NodePoolState.ReleaseNodeCount(nodePool.Name, 1)
+	})
+
 	It("should honor a static NodePool node limit before reserving replacement capacity", func() {
 		nodePool = test.StaticNodePool(v1.NodePool{
 			Spec: v1.NodePoolSpec{
@@ -882,6 +987,71 @@ var _ = Describe("Repair", func() {
 
 		commands, err := repair.ComputeCommands(ctx, map[string]int{nodePool.Name: 1}, candidates...)
 		Expect(err).NotTo(HaveOccurred())
+		Expect(commands).To(BeEmpty())
+	})
+
+	It("should reject dynamic scheduling results when the resolved condition changes during scheduling", func() {
+		cloudProvider.RepairPolicy = []cloudprovider.RepairPolicy{
+			{
+				ConditionType:          "BadNode",
+				ConditionStatus:        corev1.ConditionFalse,
+				TolerationDuration:     30 * time.Minute,
+				TerminationGracePeriod: lo.ToPtr(10 * time.Minute),
+				Action:                 cloudprovider.ReplaceNode,
+			},
+			{
+				ConditionType:          "WorseNode",
+				ConditionStatus:        corev1.ConditionFalse,
+				ReasonRegex:            ".*",
+				TolerationDuration:     5 * time.Minute,
+				TerminationGracePeriod: lo.ToPtr(2 * time.Minute),
+				Action:                 cloudprovider.ReplaceNode,
+			},
+		}
+		newRepairController()
+		initNode(nodeClaim, node)
+		bindReschedulablePod(node)
+		markUnhealthy(node, "BadNode")
+		markUnhealthy(node, "WorseNode")
+		env.Clock.Step(31 * time.Minute)
+
+		candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, env.Clock, cloudProvider, repair.ShouldDisrupt, disruption.RepairDisruptionClass, queue)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(candidates).To(HaveLen(1))
+
+		var hookRan atomic.Bool
+		hookClient := &podListHookClient{Client: env.Client, hook: func() {
+			hookRan.Store(true)
+			current := ExpectExists(ctx, env.Client, node)
+			current.Status.Conditions = lo.Reject(current.Status.Conditions, func(condition corev1.NodeCondition, _ int) bool {
+				return condition.Type == "WorseNode"
+			})
+			ExpectApplied(ctx, env.Client, current)
+			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(current))
+		}}
+		hookedProvisioner := provisioning.NewProvisioner(
+			hookClient,
+			recorder,
+			cloudProvider,
+			cluster,
+			env.Clock,
+			deviceallocation.NewController(hookClient),
+			virtualpods.NewVirtualPodCache(hookClient),
+		)
+		hookedRepair, err := disruption.NewRepair(disruption.MakeConsolidation(
+			env.Clock,
+			cluster,
+			hookClient,
+			hookedProvisioner,
+			cloudProvider,
+			recorder,
+			queue,
+		))
+		Expect(err).NotTo(HaveOccurred())
+
+		commands, err := hookedRepair.ComputeCommands(ctx, map[string]int{nodePool.Name: 1}, candidates...)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(hookRan.Load()).To(BeTrue())
 		Expect(commands).To(BeEmpty())
 	})
 

@@ -38,7 +38,9 @@ const (
 	rebootHistoryResolved
 )
 
-// RebootHistory stores process-local reboot history by NodeClaim UID.
+// RebootHistory stores process-local reboot history by NodeClaim UID. It is an orchestration primitive for the reboot
+// lifecycle stack; replace-only Repair intentionally does not instantiate it because it cannot commit or observe a
+// reboot lifecycle.
 type RebootHistory struct {
 	mu      sync.Mutex
 	entries map[types.UID]rebootHistoryState
@@ -80,10 +82,24 @@ func (h *RebootHistory) Delete(nodeClaimUID types.UID) {
 	delete(h.entries, nodeClaimUID)
 }
 
+// Resolve applies process-local reboot history to current eligible results and returns the current repair candidate.
+func (h *RebootHistory) Resolve(
+	node *corev1.Node,
+	nodeClaim *v1.NodeClaim,
+	activeRebootLifecycle bool,
+	results []Result,
+) *Candidate {
+	nodeClaimUID := nodeClaim.UID
+	unlock := h.lock(nodeClaimUID)
+	defer unlock()
+
+	return h.resolve(node, nodeClaim, activeRebootLifecycle, results)
+}
+
 // Admit applies reboot history to current eligible results and serializes final
 // admission for one NodeClaim with history creation and resolution. The callback
 // runs while the NodeClaim lock is held and returns true only after the candidate
-// crosses its commitment boundary. It must not call Admit, MarkResolved, or Delete
+// crosses its commitment boundary. It must not call Admit, Resolve, MarkResolved, or Delete
 // for the same NodeClaim UID.
 func (h *RebootHistory) Admit(
 	node *corev1.Node,
@@ -96,16 +112,10 @@ func (h *RebootHistory) Admit(
 	unlock := h.lock(nodeClaimUID)
 	defer unlock()
 
-	h.mu.Lock()
-	state := h.entries[nodeClaimUID]
-	h.mu.Unlock()
-
-	resolvedResults, rebootEscalated := resolveActions(state, activeRebootLifecycle, results)
-	candidate := ResolveCandidate(node, nodeClaim, resolvedResults)
+	candidate := h.resolve(node, nodeClaim, activeRebootLifecycle, results)
 	if candidate == nil {
 		return nil
 	}
-	candidate.RebootEscalated = rebootEscalated
 	if commit == nil {
 		return serrors.Wrap(fmt.Errorf("committing repair action, callback is nil"), "NodeClaim", klog.KObj(nodeClaim))
 	}
@@ -119,6 +129,25 @@ func (h *RebootHistory) Admit(
 		}
 	}
 	return err
+}
+
+func (h *RebootHistory) resolve(
+	node *corev1.Node,
+	nodeClaim *v1.NodeClaim,
+	activeRebootLifecycle bool,
+	results []Result,
+) *Candidate {
+	h.mu.Lock()
+	state := h.entries[nodeClaim.UID]
+	h.mu.Unlock()
+
+	resolvedResults, rebootEscalated := resolveActions(state, activeRebootLifecycle, results)
+	candidate := ResolveCandidate(node, nodeClaim, resolvedResults)
+	if candidate == nil {
+		return nil
+	}
+	candidate.RebootEscalated = rebootEscalated
+	return candidate
 }
 
 func (h *RebootHistory) lock(nodeClaimUID types.UID) func() {

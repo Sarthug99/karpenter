@@ -25,6 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	repairorchestration "sigs.k8s.io/karpenter/pkg/controllers/disruption/repair"
 	"sigs.k8s.io/karpenter/pkg/controllers/node/health"
 )
 
@@ -99,5 +100,43 @@ func TestEvaluateNodeUsesEarliestEligibleAtForEqualPriorityConditions(t *testing
 		if evaluation.result == nil || evaluation.result.ConditionType != "Earlier" {
 			t.Fatalf("expected the earliest eligible result to govern for conditions %#v, got %#v", conditions, evaluation.result)
 		}
+	}
+}
+
+func TestSameRepairResolution(t *testing.T) {
+	drainBound := 10 * time.Minute
+	resolved := &repairorchestration.Candidate{
+		NodeName:      "node",
+		NodeUID:       "node-uid",
+		NodeClaimName: "nodeclaim",
+		NodeClaimUID:  "nodeclaim-uid",
+		Action:        cloudprovider.ReplaceNode,
+		EligibleAt:    time.Unix(1, 0),
+		DrivingCondition: repairorchestration.Condition{
+			Type: "BadNode", Status: corev1.ConditionFalse, Reason: "Persistent",
+		},
+		TerminationGracePeriod: &drainBound,
+	}
+
+	unchanged := *resolved
+	unchangedDrainBound := drainBound
+	unchanged.TerminationGracePeriod = &unchangedDrainBound
+	if !sameRepairResolution(resolved, &unchanged) {
+		t.Fatal("expected equivalent multi-condition resolutions to match")
+	}
+
+	changedCondition := unchanged
+	changedCondition.DrivingCondition = repairorchestration.Condition{
+		Type: "WorseNode", Status: corev1.ConditionFalse, Reason: "Urgent",
+	}
+	if sameRepairResolution(resolved, &changedCondition) {
+		t.Fatal("expected a changed driving condition to invalidate the scheduling result")
+	}
+
+	changedDrainBound := unchanged
+	shorterDrainBound := 2 * time.Minute
+	changedDrainBound.TerminationGracePeriod = &shorterDrainBound
+	if sameRepairResolution(resolved, &changedDrainBound) {
+		t.Fatal("expected a changed drain bound to invalidate the scheduling result")
 	}
 }
