@@ -99,6 +99,13 @@ func isCandidateValidationError(err error) bool {
 	return errors.As(err, &validationErr)
 }
 
+// RepairEvidence identifies the current health evidence carried by a repair candidate.
+type RepairEvidence struct {
+	Type   corev1.NodeConditionType
+	Status corev1.ConditionStatus
+	Reason string
+}
+
 // Candidate is a state.StateNode that we are considering for disruption along with extra information to be used in
 // making that determination
 type Candidate struct {
@@ -110,6 +117,7 @@ type Candidate struct {
 	DisruptionCost    float64
 	reschedulablePods []*corev1.Pod
 	hasPodBlockers    bool
+	repairScore       float64
 
 	// Price is the cheapest compatible offering price for this candidate.
 	// Precomputed at creation to avoid repeated offering lookups.
@@ -117,14 +125,21 @@ type Candidate struct {
 	// RescheduleDisruptionCost is 1.0 (base) + sum of positive pod eviction costs
 	// for reschedulable pods. Used by balanced scoring.
 	RescheduleDisruptionCost float64
+	// Action is the disruption action selected for this candidate.
+	Action cloudprovider.RepairAction
+	// RepairEligibleAt is when the condition driving this repair completed its toleration.
+	RepairEligibleAt time.Time
 	// TerminationGracePeriod, when set, bounds this candidate's drain. After any required replacements are ready, the
 	// queue stamps the absolute termination deadline (now + this) immediately before requesting deletion, so
 	// replacement-launch latency doesn't erode the window. nil inherits the NodeClaim's own TerminationGracePeriod.
 	// Repair sets it (min(policy, NodeClaim TGP)) in ComputeCommands.
 	TerminationGracePeriod *time.Duration
-	// RepairCondition, when non-empty, is the node condition that made this candidate eligible for repair. Repair sets
-	// it in ComputeCommands; the queue emits the per-condition unhealthy-disrupted metric off it at actual termination.
-	RepairCondition corev1.NodeConditionType
+	// RepairCondition is the node condition that selected the repair action.
+	RepairCondition RepairEvidence
+	// TerminationGracePeriodCondition identifies the condition that supplied the resolved drain bound.
+	TerminationGracePeriodCondition *RepairEvidence
+	// RebootEscalated reports that recent reboot history converted a reboot result to replacement.
+	RebootEscalated bool
 }
 
 // ScoreResult holds the three values needed to decide whether a move passes.

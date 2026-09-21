@@ -38,7 +38,6 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
-	repairorchestration "sigs.k8s.io/karpenter/pkg/controllers/disruption/repair"
 	"sigs.k8s.io/karpenter/pkg/controllers/node/health"
 	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
@@ -70,7 +69,7 @@ type Repair struct {
 
 type repairNodeEvaluation struct {
 	score   float64
-	results []repairorchestration.Result
+	results []RepairResult
 }
 
 // NewRepair validates and compiles the provider's complete repair policy set before constructing the method. It panics
@@ -104,16 +103,16 @@ func (r *Repair) ShouldConsider(ctx context.Context, node *state.StateNode) bool
 	return len(r.evaluateNode(node.Node, now).results) != 0
 }
 
-// ShouldDisrupt is a predicate that filters candidates to nodes that have an unhealthy condition matching a
-// RepairPolicy, have waited past that policy's toleration, and are not vetoed by the do-not-repair annotation.
+// ShouldDisrupt filters candidates to eligible unhealthy nodes and stores the resolved repair decision for command
+// computation. Revalidation recomputes the decision from current state before replacement commitment.
 func (r *Repair) ShouldDisrupt(ctx context.Context, c *Candidate) bool {
-	return r.resolveDisruptionCandidate(ctx, c) != nil
+	return r.resolveDisruptionCandidate(ctx, c)
 }
 
-func (r *Repair) resolveDisruptionCandidate(ctx context.Context, c *Candidate) *repairorchestration.Candidate {
+func (r *Repair) resolveDisruptionCandidate(ctx context.Context, c *Candidate) bool {
 	// Repair is behind the NodeRepair feature gate, matching the old node.health controller's gating.
 	if !options.FromContext(ctx).FeatureGates.NodeRepair {
-		return nil
+		return false
 	}
 	// A disruption candidate always has a registered Node; a nil here is an invariant violation, so fail loud.
 	if c.Node == nil {
@@ -122,28 +121,29 @@ func (r *Repair) resolveDisruptionCandidate(ctx context.Context, c *Candidate) *
 	// do-not-repair is the operator's escape hatch: it blocks all repair on this node, whatever the drain bound.
 	// TODO: revisit whether do-not-disrupt should also imply do-not-repair (kubernetes-sigs/karpenter#2424).
 	if c.Annotations()[v1.DoNotRepairAnnotationKey] == "true" {
-		return nil
+		return false
 	}
 	now := r.clock.Now()
 	r.logRepairPolicyDecisions(ctx, c.Node, now)
-	resolved := r.resolveCandidate(c, now)
-	if resolved == nil {
-		return nil
+	evaluation := r.evaluateNode(c.Node, now)
+	c.repairScore = evaluation.score
+	if !resolveRepairCandidate(c, evaluation.results) {
+		return false
 	}
-	if c.hasPodBlockers && resolved.TerminationGracePeriod == nil && c.NodeClaim.Spec.TerminationGracePeriod == nil {
+	c.TerminationGracePeriod = effectiveDrainBound(c, c.TerminationGracePeriod)
+	if c.hasPodBlockers && c.TerminationGracePeriod == nil && c.NodeClaim.Spec.TerminationGracePeriod == nil {
 		r.recorder.Publish(disruptionevents.Blocked(c.Node, c.NodeClaim,
 			"repair requires a termination grace period to bypass blocking pods")...)
-		return nil
+		return false
 	}
-	return resolved
+	return true
 }
 
 // ComputeCommands orders eligible candidates by the repair score and returns one command for the highest-scoring
 // candidate whose NodePool has budget. Workload-bearing candidates verify rescheduling capacity and pre-spin any
 // required replacement; empty candidates may produce a delete-only command. Only one command per pass, mirroring drift.
 func (r *Repair) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
-	now := r.clock.Now()
-	r.sortCandidates(candidates, now)
+	r.sortCandidates(candidates)
 	trippedPools, err := r.breakerTrippedPools(ctx)
 	if err != nil {
 		return []Command{}, err
@@ -173,11 +173,7 @@ func (r *Repair) commandForCandidate(
 	if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
 		return Command{}, false, nil
 	}
-	resolved := r.resolveCandidate(candidate, r.clock.Now())
-	if resolved == nil {
-		return Command{}, false, nil
-	}
-	candidate, results, ok, err := r.replacementForCandidate(ctx, candidate, resolved)
+	candidate, results, ok, err := r.replacementForCandidate(ctx, candidate)
 	if err != nil {
 		return Command{}, false, err
 	}
@@ -187,12 +183,10 @@ func (r *Repair) commandForCandidate(
 	// Set the candidate's drain bound; after any required replacements are ready, the queue stamps the absolute deadline
 	// immediately before requesting deletion. A forceful (0) policy skips the drain for conditions the kubelet can't
 	// evict through, without replacement-launch latency eroding the window.
-	candidate.TerminationGracePeriod = effectiveDrainBound(candidate, resolved.TerminationGracePeriod)
-	candidate.RepairCondition = resolved.DrivingCondition.Type
 	log.FromContext(ctx).WithValues(append([]any{
 		"Node", klog.KObj(candidate.Node),
 		"NodeClaim", klog.KObj(candidate.NodeClaim),
-	}, resolved.LogValues()...)...).Info("resolved repair candidate")
+	}, repairLogValues(candidate)...)...).Info("resolved repair candidate")
 	return Command{
 		Candidates:          []*Candidate{candidate},
 		Replacements:        replacementsFromNodeClaims(results.NewNodeClaims...),
@@ -201,13 +195,9 @@ func (r *Repair) commandForCandidate(
 	}, true, nil
 }
 
-func (r *Repair) sortCandidates(candidates []*Candidate, now time.Time) {
-	scores := make(map[*Candidate]float64, len(candidates))
-	for _, candidate := range candidates {
-		scores[candidate] = r.evaluateNode(candidate.Node, now).score
-	}
+func (r *Repair) sortCandidates(candidates []*Candidate) {
 	sort.SliceStable(candidates, func(i, j int) bool {
-		si, sj := scores[candidates[i]], scores[candidates[j]]
+		si, sj := candidates[i].repairScore, candidates[j].repairScore
 		if si != sj {
 			return si > sj // higher score repairs first
 		}
@@ -254,14 +244,13 @@ func (r *Repair) breakerTrippedPools(ctx context.Context) (map[string]bool, erro
 func (r *Repair) replacementForCandidate(
 	ctx context.Context,
 	candidate *Candidate,
-	expectedResolution *repairorchestration.Candidate,
 ) (*Candidate, pscheduling.Results, bool, error) {
 	if candidate.OwnedByStaticNodePool() {
-		current, currentResolution, err := r.revalidateCandidate(ctx, candidate)
+		current, err := r.revalidateCandidate(ctx, candidate)
 		if err != nil || current == nil {
 			return nil, pscheduling.Results{}, false, err
 		}
-		if !sameRepairResolution(expectedResolution, currentResolution) {
+		if !sameRepairResolution(candidate, current) {
 			log.FromContext(ctx).V(1).Info("discarding repair candidate because the repair resolution changed",
 				"Node", klog.KObj(current.Node), "NodeClaim", klog.KObj(current.NodeClaim))
 			return nil, pscheduling.Results{}, false, nil
@@ -269,13 +258,12 @@ func (r *Repair) replacementForCandidate(
 		results, ok := r.staticReplacement(current)
 		return current, results, ok, nil
 	}
-	return r.dynamicReplacement(ctx, candidate, expectedResolution)
+	return r.dynamicReplacement(ctx, candidate)
 }
 
 func (r *Repair) dynamicReplacement(
 	ctx context.Context,
 	candidate *Candidate,
-	expectedResolution *repairorchestration.Candidate,
 ) (*Candidate, pscheduling.Results, bool, error) {
 	// Repair pre-spins for all reschedulable workload, including pods whose eviction is currently blocked.
 	results, err := SimulateScheduling(ctx, r.kubeClient, r.cluster, r.provisioner, r.clock, r.recorder, nil,
@@ -292,7 +280,7 @@ func (r *Repair) dynamicReplacement(
 		r.recorder.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, pretty.Sentence(results.NonPendingPodSchedulingErrors()))...)
 		return nil, pscheduling.Results{}, false, nil
 	}
-	current, currentResolution, err := r.revalidateCandidate(ctx, candidate)
+	current, err := r.revalidateCandidate(ctx, candidate)
 	if err != nil || current == nil {
 		return nil, pscheduling.Results{}, false, err
 	}
@@ -303,7 +291,7 @@ func (r *Repair) dynamicReplacement(
 			"Node", klog.KObj(current.Node), "NodeClaim", klog.KObj(current.NodeClaim))
 		return nil, pscheduling.Results{}, false, nil
 	}
-	if !sameRepairResolution(expectedResolution, currentResolution) {
+	if !sameRepairResolution(candidate, current) {
 		log.FromContext(ctx).V(1).Info("discarding repair candidate because the repair resolution changed",
 			"Node", klog.KObj(current.Node), "NodeClaim", klog.KObj(current.NodeClaim))
 		return nil, pscheduling.Results{}, false, nil
@@ -311,28 +299,28 @@ func (r *Repair) dynamicReplacement(
 	return current, results, true, nil
 }
 
-func (r *Repair) revalidateCandidate(ctx context.Context, candidate *Candidate) (*Candidate, *repairorchestration.Candidate, error) {
+func (r *Repair) revalidateCandidate(ctx context.Context, candidate *Candidate) (*Candidate, error) {
 	currentNode := r.currentCandidateNode(candidate)
 	if currentNode == nil {
-		return nil, nil, nil
+		return nil, nil
 	}
 
 	nodePool := &v1.NodePool{}
 	if err := r.kubeClient.Get(ctx, client.ObjectKey{Name: candidate.NodePool.Name}, nodePool); err != nil {
 		if apierrors.IsNotFound(err) {
-			return nil, nil, nil
+			return nil, nil
 		}
-		return nil, nil, fmt.Errorf("getting NodePool while revalidating repair candidate, %w", err)
+		return nil, fmt.Errorf("getting NodePool while revalidating repair candidate, %w", err)
 	}
 	if !nodepoolutils.IsManaged(nodePool, r.cloudProvider) {
-		return nil, nil, nil
+		return nil, nil
 	}
 	if nodePool.UID != candidate.NodePool.UID || nodePool.Generation != candidate.NodePool.Generation {
-		return nil, nil, nil
+		return nil, nil
 	}
 	pdbs, err := pdb.NewLimits(ctx, r.kubeClient)
 	if err != nil {
-		return nil, nil, fmt.Errorf("tracking PodDisruptionBudgets while revalidating repair candidate, %w", err)
+		return nil, fmt.Errorf("tracking PodDisruptionBudgets while revalidating repair candidate, %w", err)
 	}
 	instanceTypeName := currentNode.Labels()[corev1.LabelInstanceTypeStable]
 	current, err := NewCandidate(
@@ -352,15 +340,14 @@ func (r *Repair) revalidateCandidate(ctx context.Context, candidate *Candidate) 
 	if err != nil {
 		if isCandidateValidationError(err) {
 			log.FromContext(ctx).V(1).Info("discarding repair candidate after revalidation", "Node", klog.KObj(candidate.Node), "error", err)
-			return nil, nil, nil //nolint:nilerr // Candidate validation failures make this candidate stale for the current pass.
+			return nil, nil //nolint:nilerr // Candidate validation failures make this candidate stale for the current pass.
 		}
-		return nil, nil, fmt.Errorf("revalidating repair candidate, %w", err)
+		return nil, fmt.Errorf("revalidating repair candidate, %w", err)
 	}
-	resolved := r.resolveDisruptionCandidate(ctx, current)
-	if resolved == nil {
-		return nil, nil, nil
+	if !r.resolveDisruptionCandidate(ctx, current) {
+		return nil, nil
 	}
-	return current, resolved, nil
+	return current, nil
 }
 
 func (r *Repair) currentCandidateNode(candidate *Candidate) *state.StateNode {
@@ -424,7 +411,7 @@ func (r *Repair) staticReplacement(candidate *Candidate) (pscheduling.Results, b
 // (kubernetes-sigs/karpenter#3178) — it was ripped out to avoid duplicating that mechanism.
 func (r *Repair) evaluateNode(node *corev1.Node, now time.Time) repairNodeEvaluation {
 	evaluation := repairNodeEvaluation{
-		results: make([]repairorchestration.Result, 0, len(node.Status.Conditions)),
+		results: make([]RepairResult, 0, len(node.Status.Conditions)),
 	}
 	for _, condition := range node.Status.Conditions {
 		for _, policy := range r.policyMatcher.EligiblePolicies(condition, now) {
@@ -435,7 +422,7 @@ func (r *Repair) evaluateNode(node *corev1.Node, now time.Time) repairNodeEvalua
 		if result == nil {
 			continue
 		}
-		evaluation.results = append(evaluation.results, repairorchestration.Result{
+		evaluation.results = append(evaluation.results, RepairResult{
 			ConditionType:          result.ConditionType,
 			ConditionStatus:        result.ConditionStatus,
 			Reason:                 result.Reason,
@@ -540,41 +527,6 @@ func effectiveDrainBound(c *Candidate, terminationGracePeriod *time.Duration) *t
 		effective = ncTGP.Duration
 	}
 	return &effective
-}
-
-func (r *Repair) resolveCandidate(candidate *Candidate, now time.Time) *repairorchestration.Candidate {
-	return repairorchestration.ResolveCandidate(candidate.Node, candidate.NodeClaim, r.evaluateNode(candidate.Node, now).results)
-}
-
-func sameRepairResolution(previous, current *repairorchestration.Candidate) bool {
-	if previous == nil || current == nil {
-		return previous == current
-	}
-	return sameRepairTarget(previous, current) &&
-		sameRepairDecision(previous, current) &&
-		equalPointers(previous.TerminationGracePeriod, current.TerminationGracePeriod) &&
-		equalPointers(previous.TerminationGracePeriodCondition, current.TerminationGracePeriodCondition)
-}
-
-func sameRepairTarget(previous, current *repairorchestration.Candidate) bool {
-	return previous.NodeName == current.NodeName &&
-		previous.NodeUID == current.NodeUID &&
-		previous.NodeClaimName == current.NodeClaimName &&
-		previous.NodeClaimUID == current.NodeClaimUID
-}
-
-func sameRepairDecision(previous, current *repairorchestration.Candidate) bool {
-	return previous.Action == current.Action &&
-		previous.EligibleAt.Equal(current.EligibleAt) &&
-		previous.DrivingCondition == current.DrivingCondition &&
-		previous.RebootEscalated == current.RebootEscalated
-}
-
-func equalPointers[T comparable](left, right *T) bool {
-	if left == nil || right == nil {
-		return left == right
-	}
-	return *left == *right
 }
 
 func (r *Repair) Reason() v1.DisruptionReason { return v1.DisruptionReasonUnhealthy }
