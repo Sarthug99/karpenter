@@ -23,30 +23,41 @@ import (
 
 	"github.com/patrickmn/go-cache"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/clock"
 
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 )
 
 const (
-	rebootHistoryTTL             = 24 * time.Hour
+	rebootHistoryWindow          = 24 * time.Hour
 	rebootHistoryCleanupInterval = time.Hour
 	rebootsBeforeReplacement     = 2
 )
 
-// RebootHistory counts up to rebootsBeforeReplacement recently committed reboots by NodeClaim UID. Entries expire
-// automatically so a NodeClaim can become eligible for more reboots after the cooldown.
+type rebootHistoryEntry struct {
+	committedAt [rebootsBeforeReplacement]time.Time
+	count       int
+}
+
+// RebootHistory counts up to rebootsBeforeReplacement committed reboots in a sliding window by NodeClaim UID.
 type RebootHistory struct {
 	mu     sync.Mutex
+	clock  clock.Clock
 	recent *cache.Cache
 }
 
 func NewRebootHistory() *RebootHistory {
+	return newRebootHistory(clock.RealClock{})
+}
+
+func newRebootHistory(clk clock.Clock) *RebootHistory {
 	return &RebootHistory{
-		recent: cache.New(rebootHistoryTTL, rebootHistoryCleanupInterval),
+		clock:  clk,
+		recent: cache.New(rebootHistoryWindow, rebootHistoryCleanupInterval),
 	}
 }
 
-// RecordCommittedReboot consumes one reboot attempt and refreshes the cooldown after a new lifecycle handoff commits.
+// RecordCommittedReboot consumes one reboot attempt after a new lifecycle handoff commits.
 // Callers must record each committed handoff exactly once; retries that observe an active lifecycle must not record it
 // again.
 func (h *RebootHistory) RecordCommittedReboot(nodeClaimUID types.UID) {
@@ -54,11 +65,14 @@ func (h *RebootHistory) RecordCommittedReboot(nodeClaimUID types.UID) {
 	defer h.mu.Unlock()
 
 	key := string(nodeClaimUID)
-	committedReboots := h.committedReboots(nodeClaimUID)
-	if committedReboots >= rebootsBeforeReplacement {
+	now := h.clock.Now()
+	entry := h.recentReboots(nodeClaimUID, now)
+	if entry.count >= rebootsBeforeReplacement {
 		return
 	}
-	h.recent.SetDefault(key, committedReboots+1)
+	entry.committedAt[entry.count] = now
+	entry.count++
+	h.recent.SetDefault(key, entry)
 }
 
 // Resolve applies active lifecycle state and recent reboot history to current eligible results, storing the resolved
@@ -77,12 +91,24 @@ func (h *RebootHistory) Resolve(candidate *Candidate, activeRebootLifecycle bool
 }
 
 func (h *RebootHistory) committedReboots(nodeClaimUID types.UID) int {
+	return h.recentReboots(nodeClaimUID, h.clock.Now()).count
+}
+
+func (h *RebootHistory) recentReboots(nodeClaimUID types.UID, now time.Time) rebootHistoryEntry {
 	value, ok := h.recent.Get(string(nodeClaimUID))
 	if !ok {
-		return 0
+		return rebootHistoryEntry{}
 	}
-	committedReboots, _ := value.(int)
-	return committedReboots
+	entry, _ := value.(rebootHistoryEntry)
+	cutoff := now.Add(-rebootHistoryWindow)
+	recent := rebootHistoryEntry{}
+	for i := range entry.count {
+		if entry.committedAt[i].After(cutoff) {
+			recent.committedAt[recent.count] = entry.committedAt[i]
+			recent.count++
+		}
+	}
+	return recent
 }
 
 func resolveRepairActions(committedReboots int, results []RepairResult) ([]RepairResult, bool) {

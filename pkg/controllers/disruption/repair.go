@@ -106,10 +106,6 @@ func (r *Repair) ShouldConsider(ctx context.Context, node *state.StateNode) bool
 // ShouldDisrupt filters candidates to eligible unhealthy nodes and stores the resolved repair decision for command
 // computation. Revalidation recomputes the decision from current state before replacement commitment.
 func (r *Repair) ShouldDisrupt(ctx context.Context, c *Candidate) bool {
-	return r.resolveDisruptionCandidate(ctx, c)
-}
-
-func (r *Repair) resolveDisruptionCandidate(ctx context.Context, c *Candidate) bool {
 	// Repair is behind the NodeRepair feature gate, matching the old node.health controller's gating.
 	if !options.FromContext(ctx).FeatureGates.NodeRepair {
 		return false
@@ -344,7 +340,7 @@ func (r *Repair) revalidateCandidate(ctx context.Context, candidate *Candidate) 
 		}
 		return nil, fmt.Errorf("revalidating repair candidate, %w", err)
 	}
-	if !r.resolveDisruptionCandidate(ctx, current) {
+	if !r.ShouldDisrupt(ctx, current) {
 		return nil, nil
 	}
 	return current, nil

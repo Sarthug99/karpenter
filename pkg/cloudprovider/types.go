@@ -81,7 +81,7 @@ func repairActionRank(action RepairAction) int {
 	case RebootNode:
 		return 0
 	default:
-		return -1
+		panic(fmt.Sprintf("unsupported repair action %q", action))
 	}
 }
 

@@ -21,7 +21,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/patrickmn/go-cache"
+	clocktesting "k8s.io/utils/clock/testing"
 
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 )
@@ -121,46 +121,32 @@ func TestRebootHistoryKeepsReplacementAndRequiresCurrentEvidence(t *testing.T) {
 	}
 }
 
-func TestRebootHistoryExpires(t *testing.T) {
+func TestRebootHistoryUsesSlidingWindow(t *testing.T) {
+	clk := clocktesting.NewFakeClock(time.Unix(1, 0))
+	history := newRebootHistory(clk)
 	candidate := repairCandidateForTest("nodeclaim-uid")
-	history := &RebootHistory{
-		recent: cache.NewFrom(rebootHistoryTTL, 0, map[string]cache.Item{
-			string(candidate.NodeClaim.UID): {
-				Object:     rebootsBeforeReplacement,
-				Expiration: time.Now().Add(-time.Hour).UnixNano(),
-			},
-		}),
-	}
 	results := []RepairResult{
 		repairResultForTest("AcceleratorReady", "XID48", cloudprovider.RebootNode, time.Unix(1, 0), nil),
 	}
 
-	if !history.Resolve(candidate, false, results) || candidate.Action != cloudprovider.RebootNode {
-		t.Fatalf("expected reboot eligibility after the history entry expires: %#v", candidate)
+	history.RecordCommittedReboot(candidate.NodeClaim.UID)
+	clk.Step(13 * time.Hour)
+	history.RecordCommittedReboot(candidate.NodeClaim.UID)
+	if !history.Resolve(candidate, false, results) || candidate.Action != cloudprovider.ReplaceNode {
+		t.Fatalf("expected two reboots inside the window to trigger replacement: %#v", candidate)
 	}
-}
 
-func TestRebootHistoryRefreshesExpirationAfterCommit(t *testing.T) {
-	candidate := repairCandidateForTest("nodeclaim-uid")
-	key := string(candidate.NodeClaim.UID)
-	initialExpiration := time.Now().Add(time.Hour).UnixNano()
-	history := &RebootHistory{
-		recent: cache.NewFrom(rebootHistoryTTL, 0, map[string]cache.Item{
-			key: {
-				Object:     1,
-				Expiration: initialExpiration,
-			},
-		}),
+	clk.Step(12 * time.Hour)
+	if !history.Resolve(candidate, false, results) || candidate.Action != cloudprovider.RebootNode {
+		t.Fatalf("expected the reboot at t=0h to leave the window at t=25h: %#v", candidate)
+	}
+	if got := history.committedReboots(candidate.NodeClaim.UID); got != 1 {
+		t.Fatalf("expected one reboot inside the sliding window, got %d", got)
 	}
 
 	history.RecordCommittedReboot(candidate.NodeClaim.UID)
-
-	item := history.recent.Items()[key]
-	if item.Object != rebootsBeforeReplacement {
-		t.Fatalf("expected %d committed reboots, got %v", rebootsBeforeReplacement, item.Object)
-	}
-	if item.Expiration <= initialExpiration {
-		t.Fatalf("expected the second commit to refresh expiration beyond %v, got %v", initialExpiration, item.Expiration)
+	if !history.Resolve(candidate, false, results) || candidate.Action != cloudprovider.ReplaceNode {
+		t.Fatalf("expected reboots at t=13h and t=25h to trigger replacement: %#v", candidate)
 	}
 }
 
