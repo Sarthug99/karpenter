@@ -113,9 +113,7 @@ var _ = Describe("Reboot Lifecycle", func() {
 			Expect(cond.IsTrue()).To(BeTrue())
 			Expect(cond.Reason).To(Equal(v1.RebootReasonIssued))
 			Expect(nodeClaim.Annotations).To(HaveKeyWithValue(v1.RebootPreBootIDAnnotationKey, "boot-1"))
-			Expect(nodeClaim.Annotations[v1.RebootOperationIDAnnotationKey]).ToNot(BeEmpty())
-			Expect(nodeClaim.Annotations).To(HaveKey(v1.RebootIssuedAtAnnotationKey))
-			Expect(nodeClaim.Annotations).To(HaveKey(v1.RebootRequestedAtAnnotationKey))
+			Expect(cloudProvider.RebootOperationIDs[0]).ToNot(BeEmpty())
 			// Initialization is invalidated by a committed reboot until the node re-initializes.
 			Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized).Status).To(Equal(metav1.ConditionUnknown))
 
@@ -127,15 +125,40 @@ var _ = Describe("Reboot Lifecycle", func() {
 			Expect(recorder.Calls(events.RebootIssued)).To(Equal(1))
 		})
 
-		It("mints the operationID once and reuses it across reconciles", func() {
+		It("re-issues on a subsequent reboot of the same NodeClaim (no stale-state false success)", func() {
+			// Episode 1: request -> issue -> succeed.
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
-			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
-			operationID := nodeClaim.Annotations[v1.RebootOperationIDAnnotationKey]
+			Expect(cloudProvider.RebootCalls).To(HaveLen(1))
+			firstID := cloudProvider.RebootOperationIDs[0]
 
+			node = ExpectExists(ctx, env.Client, node)
+			node.Status.NodeInfo.BootID = "boot-2"
+			node.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
+			ExpectApplied(ctx, env.Client, node)
+			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
 			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
 			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
-			Expect(nodeClaim.Annotations[v1.RebootOperationIDAnnotationKey]).To(Equal(operationID))
+			Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).Reason).To(Equal(v1.RebootReasonSucceeded))
+			// Episode-scoped state is cleared at terminal, so it can't leak into the next reboot.
+			Expect(nodeClaim.Annotations).ToNot(HaveKey(v1.RebootPreBootIDAnnotationKey))
+
+			// Episode 2: the node has re-initialized and the consumer re-requests a reboot on the same NodeClaim.
+			node = ExpectExists(ctx, env.Client, node)
+			node.Status.NodeInfo.BootID = "boot-2" // current boot; a stale pre-boot-id would falsely "prove" a reboot
+			ExpectApplied(ctx, env.Client, node)
+			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+			nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeInitialized)
+			nodeClaim.StatusConditions().SetTrueWithReason(v1.ConditionTypeRebooting, v1.RebootReasonRequested, "reboot requested again")
+			ExpectApplied(ctx, env.Client, nodeClaim)
+			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
+
+			// The second episode must actually issue — not short-circuit to success on stale state.
+			Expect(cloudProvider.RebootCalls).To(HaveLen(2))
+			Expect(cloudProvider.RebootOperationIDs[1]).ToNot(Equal(firstID)) // distinct per episode
+			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+			Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).Reason).To(Equal(v1.RebootReasonIssued))
+			Expect(nodeClaim.Annotations).To(HaveKeyWithValue(v1.RebootPreBootIDAnnotationKey, "boot-2"))
 		})
 
 		It("fails with provider_error when the provider does not implement reboot", func() {
@@ -170,8 +193,7 @@ var _ = Describe("Reboot Lifecycle", func() {
 
 		It("skips issuing when the boot already changed after recording issuing state (restart safety)", func() {
 			nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{
-				v1.RebootPreBootIDAnnotationKey:   "boot-1",
-				v1.RebootOperationIDAnnotationKey: "op-persisted",
+				v1.RebootPreBootIDAnnotationKey: "boot-1",
 			})
 			node.Status.NodeInfo.BootID = "boot-2"
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
@@ -197,14 +219,12 @@ var _ = Describe("Reboot Lifecycle", func() {
 
 	Context("RebootIssued", func() {
 		BeforeEach(func() {
-			now := env.Clock.Now().Format(time.RFC3339)
 			nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{
-				v1.RebootPreBootIDAnnotationKey:   "boot-1",
-				v1.RebootOperationIDAnnotationKey: "op-1",
-				v1.RebootIssuedAtAnnotationKey:    now,
-				v1.RebootRequestedAtAnnotationKey: now,
+				v1.RebootPreBootIDAnnotationKey: "boot-1",
 			})
 			nodeClaim.StatusConditions().SetTrueWithReason(v1.ConditionTypeRebooting, v1.RebootReasonIssued, "reboot issued")
+			// issuedAt is derived from the Initialized->Unknown transition, set at issue time.
+			nodeClaim.StatusConditions().SetUnknownWithReason(v1.ConditionTypeInitialized, v1.RebootReasonRequested, "node is rebooting")
 			node.Spec.Taints = append(node.Spec.Taints, v1.RebootingNoScheduleTaint)
 		})
 

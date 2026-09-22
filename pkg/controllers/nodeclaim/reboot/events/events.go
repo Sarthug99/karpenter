@@ -38,9 +38,19 @@ func event(nodeClaim *v1.NodeClaim, eventType, reason, message string) events.Ev
 		Type:           eventType,
 		Reason:         reason,
 		Message:        message,
-		DedupeValues:   []string{string(nodeClaim.UID)},
-		DedupeTimeout:  dedupeTimeout,
+		// Key dedupe on the reboot episode (the Rebooting condition's transition time), not just the
+		// NodeClaim UID, so a subsequent reboot on the same node isn't falsely deduped as the previous one.
+		DedupeValues:  []string{string(nodeClaim.UID), rebootEpisode(nodeClaim)},
+		DedupeTimeout: dedupeTimeout,
 	}
+}
+
+// rebootEpisode identifies the current reboot episode by the Rebooting condition's transition time.
+func rebootEpisode(nodeClaim *v1.NodeClaim) string {
+	if cond := nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting); cond != nil {
+		return cond.LastTransitionTime.Format(time.RFC3339Nano)
+	}
+	return ""
 }
 
 func Requested(nodeClaim *v1.NodeClaim) events.Event {

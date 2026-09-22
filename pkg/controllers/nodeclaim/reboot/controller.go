@@ -26,10 +26,10 @@ import (
 	"time"
 
 	"github.com/awslabs/operatorpkg/reasonable"
-	"github.com/google/uuid"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/clock"
 	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -120,10 +120,6 @@ func (c *Controller) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (re
 // reconcileRequested applies the scheduling fence, drains (bounded), then issues the provider reboot.
 func (c *Controller) reconcileRequested(ctx context.Context, nodeClaim *v1.NodeClaim, node *corev1.Node) (reconcile.Result, error) {
 	c.recorder.Publish(rebootevents.Requested(nodeClaim))
-	// Stamp the request time (the total-duration metric's start) before draining.
-	if err := c.ensureRequestedAt(ctx, nodeClaim); err != nil {
-		return reconcile.Result{}, err
-	}
 	// Scheduling fence: reboot-owned taint that keeps evicted pods from rescheduling onto the pre-reboot boot.
 	if err := c.ensureRebootTaint(ctx, node); err != nil {
 		return reconcile.Result{}, err
@@ -141,15 +137,14 @@ func (c *Controller) reconcileRequested(ctx context.Context, nodeClaim *v1.NodeC
 		if done, res, err := c.drain(ctx, nodeClaim, node); err != nil || !done {
 			return res, err
 		}
-		// Record pre-boot state before the first provider call, and mint a stable operationID.
+		// Record pre-boot state before the first provider call.
 		if err := c.recordIssuingState(ctx, nodeClaim, node); err != nil {
 			return reconcile.Result{}, err
 		}
 	}
 
-	// Issue the reboot with the persisted, stable operationID.
-	operationID := nodeClaim.Annotations[v1.RebootOperationIDAnnotationKey]
-	if err := c.cloudProvider.Reboot(ctx, nodeClaim, operationID); err != nil {
+	// Issue the reboot with a deterministic, per-episode operationID (stable across retries/restarts).
+	if err := c.cloudProvider.Reboot(ctx, nodeClaim, rebootOperationID(nodeClaim)); err != nil {
 		if cloudprovider.IsNodeRebootNotImplementedError(err) {
 			return c.transitionToFailed(ctx, nodeClaim, node, resultProviderError, "reboot not implemented by the cloud provider")
 		}
@@ -194,7 +189,7 @@ func (c *Controller) drain(ctx context.Context, nodeClaim *v1.NodeClaim, node *c
 		return true, reconcile.Result{}, nil
 	}
 	// Deadline is measured from when the reboot was requested (the Rebooting condition's transition).
-	deadline := nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).LastTransitionTime.Add(dgp)
+	deadline := rebootRequestedAt(nodeClaim).Add(dgp)
 	if err := c.terminator.Drain(ctx, node, &deadline); err != nil {
 		if !terminator.IsNodeDrainError(err) {
 			return false, reconcile.Result{}, fmt.Errorf("draining node, %w", err)
@@ -207,13 +202,10 @@ func (c *Controller) drain(ctx context.Context, nodeClaim *v1.NodeClaim, node *c
 	return true, reconcile.Result{}, nil
 }
 
-// recordIssuingState mints the operationID and records the pre-reboot bootID before the first provider
-// call, so retries and restarts reuse the same operationID and the reboot is detectable after a restart.
+// recordIssuingState records the pre-reboot bootID before the first provider call, so a changed bootID
+// afterward proves the reboot happened (restart-safety) and terminal cleanup can scope to this episode.
 func (c *Controller) recordIssuingState(ctx context.Context, nodeClaim *v1.NodeClaim, node *corev1.Node) error {
 	stored := nodeClaim.DeepCopy()
-	if nodeClaim.Annotations[v1.RebootOperationIDAnnotationKey] == "" {
-		nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{v1.RebootOperationIDAnnotationKey: uuid.NewString()})
-	}
 	nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{v1.RebootPreBootIDAnnotationKey: node.Status.NodeInfo.BootID})
 	if equality.Semantic.DeepEqual(stored, nodeClaim) {
 		return nil
@@ -222,18 +214,10 @@ func (c *Controller) recordIssuingState(ctx context.Context, nodeClaim *v1.NodeC
 }
 
 func (c *Controller) transitionToIssued(ctx context.Context, nodeClaim *v1.NodeClaim, node *corev1.Node) (reconcile.Result, error) {
-	// Stamp issued-at (metadata) first, then flip conditions (status) from a fresh snapshot: each patch's
-	// server response overwrites the in-memory object, so a single shared snapshot would clobber the other.
 	stored := nodeClaim.DeepCopy()
-	nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{v1.RebootIssuedAtAnnotationKey: c.clock.Now().Format(time.RFC3339)})
-	if !equality.Semantic.DeepEqual(stored, nodeClaim) {
-		if err := c.kubeClient.Patch(ctx, nodeClaim, client.MergeFrom(stored)); err != nil {
-			return reconcile.Result{}, err
-		}
-	}
-	stored = nodeClaim.DeepCopy()
 	nodeClaim.StatusConditions().SetTrueWithReason(v1.ConditionTypeRebooting, v1.RebootReasonIssued, "reboot issued to the provider")
 	// Initialization is scoped to a boot; a committed reboot invalidates it until the node re-initializes.
+	// The Initialized->Unknown transition time also serves as the issuance timestamp (see issuedAt).
 	nodeClaim.StatusConditions().SetUnknownWithReason(v1.ConditionTypeInitialized, v1.RebootReasonRequested, "node is rebooting")
 	if !equality.Semantic.DeepEqual(stored, nodeClaim) {
 		if err := c.kubeClient.Status().Patch(ctx, nodeClaim, client.MergeFrom(stored)); err != nil {
@@ -272,7 +256,16 @@ func (c *Controller) transitionToFailed(ctx context.Context, nodeClaim *v1.NodeC
 }
 
 func (c *Controller) setTerminal(ctx context.Context, nodeClaim *v1.NodeClaim, reason, msg string) (reconcile.Result, error) {
+	// Clear episode-scoped reboot state (metadata) first, so a later reboot on this NodeClaim starts clean
+	// and the restart-safety check can't misfire on a prior episode's pre-boot bootID.
 	stored := nodeClaim.DeepCopy()
+	if _, ok := nodeClaim.Annotations[v1.RebootPreBootIDAnnotationKey]; ok {
+		delete(nodeClaim.Annotations, v1.RebootPreBootIDAnnotationKey)
+		if err := c.kubeClient.Patch(ctx, nodeClaim, client.MergeFrom(stored)); err != nil {
+			return reconcile.Result{}, err
+		}
+	}
+	stored = nodeClaim.DeepCopy()
 	nodeClaim.StatusConditions().SetFalse(v1.ConditionTypeRebooting, reason, msg)
 	if !equality.Semantic.DeepEqual(stored, nodeClaim) {
 		if err := c.kubeClient.Status().Patch(ctx, nodeClaim, client.MergeFrom(stored)); err != nil {
@@ -318,31 +311,36 @@ func (c *Controller) drainGracePeriod(nodeClaim *v1.NodeClaim) time.Duration {
 	return d
 }
 
+// issuedAt derives the issuance time from the Initialized condition, which transitions to Unknown exactly
+// when the reboot is issued and is held there (by the initialization guard) until the reboot is terminal.
 func (c *Controller) issuedAt(nodeClaim *v1.NodeClaim) (time.Time, bool) {
-	t, err := time.Parse(time.RFC3339, nodeClaim.Annotations[v1.RebootIssuedAtAnnotationKey])
-	if err != nil {
+	cond := nodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized)
+	if cond == nil || cond.Status != metav1.ConditionUnknown {
 		return time.Time{}, false
 	}
-	return t, true
+	return cond.LastTransitionTime.Time, true
 }
 
-// ensureRequestedAt stamps the reboot request time (the Rebooting condition's transition) once, so the
-// total-duration metric can measure request -> terminal across drain, issue, and observe.
-func (c *Controller) ensureRequestedAt(ctx context.Context, nodeClaim *v1.NodeClaim) error {
-	if _, ok := nodeClaim.Annotations[v1.RebootRequestedAtAnnotationKey]; ok {
-		return nil
-	}
-	requestedAt := nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).LastTransitionTime.Time
-	stored := nodeClaim.DeepCopy()
-	nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{v1.RebootRequestedAtAnnotationKey: requestedAt.Format(time.RFC3339)})
-	return c.kubeClient.Patch(ctx, nodeClaim, client.MergeFrom(stored))
+// rebootRequestedAt is when the current reboot episode was committed: the Rebooting condition's transition
+// to True. operatorpkg preserves LastTransitionTime across the RebootRequested->RebootIssued reason change
+// (status stays True), so this is stable for the whole episode until the terminal SetFalse.
+func rebootRequestedAt(nodeClaim *v1.NodeClaim) time.Time {
+	return nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).LastTransitionTime.Time
+}
+
+// rebootOperationID is a deterministic, per-episode idempotency key passed to CloudProvider.Reboot: stable
+// across retries and controller restarts within an episode, and distinct across episodes. Derived from the
+// request time and the pre-reboot bootID (recorded before issuing) rather than stored, so no annotation is
+// needed and stale keys can't leak. The bootID disambiguates episodes within the same second, since
+// metav1.Time (the request time's source) only round-trips at second precision.
+func rebootOperationID(nodeClaim *v1.NodeClaim) string {
+	return fmt.Sprintf("%s-%d-%s", nodeClaim.UID, rebootRequestedAt(nodeClaim).UnixNano(), nodeClaim.Annotations[v1.RebootPreBootIDAnnotationKey])
 }
 
 // recordTerminalMetrics counts the reboot by result and observes the full-action duration (request ->
-// terminal), on every terminal outcome.
+// terminal). Must be called while the Rebooting condition is still True (before setTerminal resets its
+// transition time).
 func (c *Controller) recordTerminalMetrics(nodeClaim *v1.NodeClaim, result string) {
 	RebootsTotal.Inc(map[string]string{resultLabel: result})
-	if requestedAt, err := time.Parse(time.RFC3339, nodeClaim.Annotations[v1.RebootRequestedAtAnnotationKey]); err == nil {
-		RebootDurationSeconds.Observe(c.clock.Since(requestedAt).Seconds(), map[string]string{resultLabel: result})
-	}
+	RebootDurationSeconds.Observe(c.clock.Since(rebootRequestedAt(nodeClaim)).Seconds(), map[string]string{resultLabel: result})
 }
