@@ -215,6 +215,25 @@ var _ = Describe("Reboot Lifecycle", func() {
 			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
 			Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).Reason).To(Equal(v1.RebootReasonRequested))
 		})
+
+		It("fails with provider_error when issuance does not succeed within the issuance timeout", func() {
+			// Simulate a reboot stuck in the post-drain provider-accept loop.
+			nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{
+				v1.RebootPreBootIDAnnotationKey:         "boot-1",
+				v1.RebootIssuanceStartedAtAnnotationKey: env.Clock.Now().Format(time.RFC3339),
+			})
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			env.Clock.Step(6 * time.Minute) // past the 5m issuance timeout
+			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
+
+			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+			cond := nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting)
+			Expect(cond.IsFalse()).To(BeTrue())
+			Expect(cond.Reason).To(Equal(v1.RebootReasonFailed))
+			Expect(cloudProvider.RebootCalls).To(BeEmpty()) // failed at the deadline, never re-issued
+			Expect(recorder.Calls(events.RebootFailed)).To(Equal(1))
+			ExpectMetricCounterValue(reboot.RebootsTotal, 1, map[string]string{"result": "provider_error"})
+		})
 	})
 
 	Context("RebootIssued", func() {
@@ -285,6 +304,27 @@ var _ = Describe("Reboot Lifecycle", func() {
 
 			Expect(recorder.Calls(events.RebootFailed)).To(Equal(1))
 			ExpectMetricCounterValue(reboot.RebootsTotal, 1, map[string]string{"result": "recovery_timeout"})
+		})
+
+		It("fails when the node is gone and the deadline has elapsed", func() {
+			env.Clock.Step(21 * time.Minute)
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim) // node intentionally not applied
+			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
+
+			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+			cond := nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting)
+			Expect(cond.IsFalse()).To(BeTrue())
+			Expect(cond.Reason).To(Equal(v1.RebootReasonFailed))
+			ExpectMetricCounterValue(reboot.RebootsTotal, 1, map[string]string{"result": "recovery_timeout"})
+		})
+
+		It("keeps polling when the node is gone but the deadline has not elapsed", func() {
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim) // node intentionally not applied
+			result := ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
+
+			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+			Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).Reason).To(Equal(v1.RebootReasonIssued))
 		})
 	})
 })

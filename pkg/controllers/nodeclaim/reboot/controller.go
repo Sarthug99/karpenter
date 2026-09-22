@@ -56,6 +56,9 @@ const (
 	observationWindow = 20 * time.Minute
 	// pollInterval is how often we re-check for boot/readiness while observing recovery.
 	pollInterval = 15 * time.Second
+	// issuanceTimeout bounds the post-drain provider-accept retry loop before declaring RebootFailed.
+	// Mirrors nodeclaim lifecycle's LaunchTimeout: a provider control-plane call should complete within it.
+	issuanceTimeout = 5 * time.Minute
 )
 
 // Controller drives the reboot lifecycle for NodeClaims carrying an active Rebooting condition.
@@ -103,8 +106,25 @@ func (c *Controller) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (re
 
 	node, err := nodeclaimutils.NodeForNodeClaim(ctx, c.kubeClient, nodeClaim)
 	if err != nil {
-		// A missing node is expected transiently; requeue and retry.
-		return reconcile.Result{}, nodeclaimutils.IgnoreNodeNotFoundError(err)
+		if !nodeclaimutils.IsNodeNotFoundError(err) {
+			return reconcile.Result{}, err
+		}
+		// The Node is gone mid-reboot: we can neither observe recovery nor clean the fence (it went with
+		// the Node). Fail if the deadline has elapsed, otherwise keep polling until it does — never a
+		// silent no-requeue stop, which would wedge the NodeClaim at Rebooting=True forever.
+		if c.pastRebootDeadline(nodeClaim) {
+			result, msg := deadlineResult(nodeClaim)
+			return c.transitionToFailed(ctx, nodeClaim, nil, result, msg)
+		}
+		return reconcile.Result{RequeueAfter: pollInterval}, nil
+	}
+
+	// Bound every phase: a reboot that never issues (request phase) or never recovers (observe phase) is
+	// failed here rather than retrying forever, since Rebooting=True excludes the node from other
+	// disruption and advertises returning capacity to the scheduler.
+	if c.pastRebootDeadline(nodeClaim) {
+		result, msg := deadlineResult(nodeClaim)
+		return c.transitionToFailed(ctx, nodeClaim, node, result, msg)
 	}
 
 	switch cond.Reason {
@@ -173,10 +193,7 @@ func (c *Controller) reconcileIssued(ctx context.Context, nodeClaim *v1.NodeClai
 	if bootChanged && ready {
 		return c.transitionToSucceeded(ctx, nodeClaim, node)
 	}
-
-	if issuedAt, ok := c.issuedAt(nodeClaim); ok && c.clock.Since(issuedAt) > observationWindow {
-		return c.transitionToFailed(ctx, nodeClaim, node, resultRecoveryTimeout, "node did not recover within observation window")
-	}
+	// The observation-window timeout is enforced by the phase-agnostic deadline check in Reconcile.
 	return reconcile.Result{RequeueAfter: pollInterval}, nil
 }
 
@@ -206,7 +223,12 @@ func (c *Controller) drain(ctx context.Context, nodeClaim *v1.NodeClaim, node *c
 // afterward proves the reboot happened (restart-safety) and terminal cleanup can scope to this episode.
 func (c *Controller) recordIssuingState(ctx context.Context, nodeClaim *v1.NodeClaim, node *corev1.Node) error {
 	stored := nodeClaim.DeepCopy()
-	nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{v1.RebootPreBootIDAnnotationKey: node.Status.NodeInfo.BootID})
+	// Record the pre-reboot bootID (restart-safety / episode scoping) and the drain-completion time, which
+	// anchors the post-drain issuance timeout independently of how much of the drain budget was used.
+	nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{
+		v1.RebootPreBootIDAnnotationKey:         node.Status.NodeInfo.BootID,
+		v1.RebootIssuanceStartedAtAnnotationKey: c.clock.Now().Format(time.RFC3339),
+	})
 	if equality.Semantic.DeepEqual(stored, nodeClaim) {
 		return nil
 	}
@@ -246,9 +268,12 @@ func (c *Controller) transitionToSucceeded(ctx context.Context, nodeClaim *v1.No
 }
 
 func (c *Controller) transitionToFailed(ctx context.Context, nodeClaim *v1.NodeClaim, node *corev1.Node, result, msg string) (reconcile.Result, error) {
-	// Terminal cleanup: ensure the reboot-owned fence is removed even if the boot never changed.
-	if err := c.removeRebootTaint(ctx, node); err != nil {
-		return reconcile.Result{}, err
+	// Terminal cleanup: ensure the reboot-owned fence is removed even if the boot never changed. node may
+	// be nil when it was deleted mid-reboot, in which case the fence went with it — nothing to clean.
+	if node != nil {
+		if err := c.removeRebootTaint(ctx, node); err != nil {
+			return reconcile.Result{}, err
+		}
 	}
 	c.recorder.Publish(rebootevents.Failed(nodeClaim, msg))
 	c.recordTerminalMetrics(nodeClaim, result)
@@ -259,8 +284,11 @@ func (c *Controller) setTerminal(ctx context.Context, nodeClaim *v1.NodeClaim, r
 	// Clear episode-scoped reboot state (metadata) first, so a later reboot on this NodeClaim starts clean
 	// and the restart-safety check can't misfire on a prior episode's pre-boot bootID.
 	stored := nodeClaim.DeepCopy()
-	if _, ok := nodeClaim.Annotations[v1.RebootPreBootIDAnnotationKey]; ok {
+	_, hadPreBoot := nodeClaim.Annotations[v1.RebootPreBootIDAnnotationKey]
+	_, hadStarted := nodeClaim.Annotations[v1.RebootIssuanceStartedAtAnnotationKey]
+	if hadPreBoot || hadStarted {
 		delete(nodeClaim.Annotations, v1.RebootPreBootIDAnnotationKey)
+		delete(nodeClaim.Annotations, v1.RebootIssuanceStartedAtAnnotationKey)
 		if err := c.kubeClient.Patch(ctx, nodeClaim, client.MergeFrom(stored)); err != nil {
 			return reconcile.Result{}, err
 		}
@@ -319,6 +347,47 @@ func (c *Controller) issuedAt(nodeClaim *v1.NodeClaim) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	return cond.LastTransitionTime.Time, true
+}
+
+// issuanceStartedAt is when the drain completed and the provider-accept retry loop began.
+func (c *Controller) issuanceStartedAt(nodeClaim *v1.NodeClaim) (time.Time, bool) {
+	t, err := time.Parse(time.RFC3339, nodeClaim.Annotations[v1.RebootIssuanceStartedAtAnnotationKey])
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
+// rebootDeadline is the wall-clock bound for the current phase, after which the reboot is failed. It is
+// derived only from the NodeClaim (never the Node), so it fires even when the Node has been deleted.
+func (c *Controller) rebootDeadline(nodeClaim *v1.NodeClaim) time.Time {
+	if nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).Reason == v1.RebootReasonIssued {
+		if issuedAt, ok := c.issuedAt(nodeClaim); ok {
+			return issuedAt.Add(observationWindow)
+		}
+		// Fallback if issuedAt isn't derivable: the full request budget plus the observation window.
+		return rebootRequestedAt(nodeClaim).Add(c.drainGracePeriod(nodeClaim) + issuanceTimeout + observationWindow)
+	}
+	// RebootRequested: once issuing, bound the provider-accept loop from drain-completion. Before drain
+	// completes, fall back to the full request budget (drain + issuance) so a wedge during drain — e.g. a
+	// missing Node — still fails rather than polling forever.
+	if startedAt, ok := c.issuanceStartedAt(nodeClaim); ok {
+		return startedAt.Add(issuanceTimeout)
+	}
+	return rebootRequestedAt(nodeClaim).Add(c.drainGracePeriod(nodeClaim) + issuanceTimeout)
+}
+
+func (c *Controller) pastRebootDeadline(nodeClaim *v1.NodeClaim) bool {
+	return c.clock.Now().After(c.rebootDeadline(nodeClaim))
+}
+
+// deadlineResult maps the current phase to the terminal result label and message used when the deadline
+// elapses: the request phase failed to issue (provider_error); the observe phase failed to recover.
+func deadlineResult(nodeClaim *v1.NodeClaim) (result, msg string) {
+	if nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).Reason == v1.RebootReasonIssued {
+		return resultRecoveryTimeout, "node did not recover within the observation window"
+	}
+	return resultProviderError, "reboot was not issued within the issuance timeout"
 }
 
 // rebootRequestedAt is when the current reboot episode was committed: the Rebooting condition's transition
