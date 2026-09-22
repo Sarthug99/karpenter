@@ -18,6 +18,7 @@ package disruption
 
 import (
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/patrickmn/go-cache"
@@ -29,11 +30,13 @@ import (
 const (
 	rebootHistoryTTL             = 24 * time.Hour
 	rebootHistoryCleanupInterval = time.Hour
+	rebootsBeforeReplacement     = 2
 )
 
-// RebootHistory records recently committed reboots by NodeClaim UID. Entries expire automatically so a healthy
-// NodeClaim can become eligible for another reboot after the cooldown.
+// RebootHistory counts up to rebootsBeforeReplacement recently committed reboots by NodeClaim UID. Entries expire
+// automatically so a NodeClaim can become eligible for more reboots after the cooldown.
 type RebootHistory struct {
+	mu     sync.Mutex
 	recent *cache.Cache
 }
 
@@ -43,9 +46,19 @@ func NewRebootHistory() *RebootHistory {
 	}
 }
 
-// RecordCommittedReboot starts the reboot cooldown after the lifecycle handoff commits.
+// RecordCommittedReboot consumes one reboot attempt and refreshes the cooldown after a new lifecycle handoff commits.
+// Callers must record each committed handoff exactly once; retries that observe an active lifecycle must not record it
+// again.
 func (h *RebootHistory) RecordCommittedReboot(nodeClaimUID types.UID) {
-	h.recent.SetDefault(string(nodeClaimUID), struct{}{})
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	key := string(nodeClaimUID)
+	committedReboots := h.committedReboots(nodeClaimUID)
+	if committedReboots >= rebootsBeforeReplacement {
+		return
+	}
+	h.recent.SetDefault(key, committedReboots+1)
 }
 
 // Resolve applies active lifecycle state and recent reboot history to current eligible results, storing the resolved
@@ -55,8 +68,7 @@ func (h *RebootHistory) Resolve(candidate *Candidate, activeRebootLifecycle bool
 		clearRepairResolution(candidate)
 		return false
 	}
-	_, recentlyRebooted := h.recent.Get(string(candidate.NodeClaim.UID))
-	resolvedResults, rebootEscalated := resolveRepairActions(recentlyRebooted, results)
+	resolvedResults, rebootEscalated := resolveRepairActions(h.committedReboots(candidate.NodeClaim.UID), results)
 	if !resolveRepairCandidate(candidate, resolvedResults) {
 		return false
 	}
@@ -64,8 +76,17 @@ func (h *RebootHistory) Resolve(candidate *Candidate, activeRebootLifecycle bool
 	return true
 }
 
-func resolveRepairActions(recentlyRebooted bool, results []RepairResult) ([]RepairResult, bool) {
-	if len(results) == 0 || !recentlyRebooted {
+func (h *RebootHistory) committedReboots(nodeClaimUID types.UID) int {
+	value, ok := h.recent.Get(string(nodeClaimUID))
+	if !ok {
+		return 0
+	}
+	committedReboots, _ := value.(int)
+	return committedReboots
+}
+
+func resolveRepairActions(committedReboots int, results []RepairResult) ([]RepairResult, bool) {
+	if len(results) == 0 || committedReboots < rebootsBeforeReplacement {
 		return results, false
 	}
 
