@@ -266,6 +266,49 @@ var _ = Describe("Repair", func() {
 		Expect(queue.GetCommands()).To(HaveLen(1))
 	})
 
+	It("should commit an in-place reboot (no replacement, no termination) for a RebootNode policy", func() {
+		cloudProvider.RepairPolicy = []cloudprovider.RepairPolicy{
+			{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, ReasonRegex: "RebootMe", TolerationDuration: 10 * time.Minute, Action: cloudprovider.RebootNode, TerminationGracePeriod: lo.ToPtr(5 * time.Minute)},
+			{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, TolerationDuration: 30 * time.Minute, Action: cloudprovider.ReplaceNode},
+		}
+		newRepairController()
+		initNode(nodeClaim, node)
+		markUnhealthyWithReason(node, "BadNode", "RebootMe")
+		env.Clock.Step(11 * time.Minute) // past the reboot toleration, before the replace fallback
+
+		ExpectSingletonReconciled(ctx, repairController)
+
+		// Reboot is in-place: no replace-then-terminate command is queued.
+		Expect(queue.GetCommands()).To(BeEmpty())
+
+		// The NodeClaim is handed off to the reboot controller (Rebooting=RebootRequested + drain bound) and not terminated.
+		nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+		cond := nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting)
+		Expect(cond.IsTrue()).To(BeTrue())
+		Expect(cond.Reason).To(Equal(v1.RebootReasonRequested))
+		Expect(nodeClaim.Annotations).To(HaveKeyWithValue(v1.RebootTerminationGracePeriodAnnotationKey, "5m0s"))
+		Expect(nodeClaim.DeletionTimestamp.IsZero()).To(BeTrue())
+	})
+
+	It("should inherit the NodeClaim TerminationGracePeriod when the RebootNode policy sets none", func() {
+		cloudProvider.RepairPolicy = []cloudprovider.RepairPolicy{
+			{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, ReasonRegex: "RebootMe", TolerationDuration: 10 * time.Minute, Action: cloudprovider.RebootNode},
+			{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, TolerationDuration: 30 * time.Minute, Action: cloudprovider.ReplaceNode},
+		}
+		nodeClaim.Spec.TerminationGracePeriod = &metav1.Duration{Duration: 7 * time.Minute}
+		newRepairController()
+		initNode(nodeClaim, node)
+		markUnhealthyWithReason(node, "BadNode", "RebootMe")
+		env.Clock.Step(11 * time.Minute)
+
+		ExpectSingletonReconciled(ctx, repairController)
+
+		nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+		Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).Reason).To(Equal(v1.RebootReasonRequested))
+		// A nil policy TGP inherits the NodeClaim (NodePool) TerminationGracePeriod, not 0s/forceful.
+		Expect(nodeClaim.Annotations).To(HaveKeyWithValue(v1.RebootTerminationGracePeriodAnnotationKey, "7m0s"))
+	})
+
 	It("should preserve condition age across a reason-only change", func() {
 		cloudProvider.RepairPolicy = []cloudprovider.RepairPolicy{
 			{
