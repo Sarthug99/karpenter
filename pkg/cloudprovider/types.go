@@ -70,6 +70,7 @@ const (
 )
 
 // IsMoreDisruptiveThan returns whether the repair action is more disruptive than another action.
+// It panics if either action is unsupported.
 func (a RepairAction) IsMoreDisruptiveThan(other RepairAction) bool {
 	return repairActionRank(a) > repairActionRank(other)
 }

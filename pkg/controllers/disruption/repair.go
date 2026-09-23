@@ -91,20 +91,8 @@ func NewRepair(c consolidation) *Repair {
 	}
 }
 
-// ShouldConsider cheaply rejects healthy or not-yet-eligible nodes before disruption candidate construction.
-func (r *Repair) ShouldConsider(ctx context.Context, node *state.StateNode) bool {
-	if !options.FromContext(ctx).FeatureGates.NodeRepair ||
-		node.Node == nil ||
-		node.Annotations()[v1.DoNotRepairAnnotationKey] == "true" {
-		return false
-	}
-	now := r.clock.Now()
-	r.logRepairPolicyDecisions(ctx, node.Node, now)
-	return len(r.evaluateNode(node.Node, now).results) != 0
-}
-
-// ShouldDisrupt filters candidates to eligible unhealthy nodes and stores the resolved repair decision for command
-// computation. Revalidation recomputes the decision from current state before replacement commitment.
+// ShouldDisrupt is a predicate that filters candidates to nodes that have an unhealthy condition matching a
+// RepairPolicy, have waited past that policy's toleration, and are not vetoed by the do-not-repair annotation.
 func (r *Repair) ShouldDisrupt(ctx context.Context, c *Candidate) bool {
 	// Repair is behind the NodeRepair feature gate, matching the old node.health controller's gating.
 	if !options.FromContext(ctx).FeatureGates.NodeRepair {
@@ -176,9 +164,6 @@ func (r *Repair) commandForCandidate(
 	if !ok {
 		return Command{}, false, nil
 	}
-	// Set the candidate's drain bound; after any required replacements are ready, the queue stamps the absolute deadline
-	// immediately before requesting deletion. A forceful (0) policy skips the drain for conditions the kubelet can't
-	// evict through, without replacement-launch latency eroding the window.
 	log.FromContext(ctx).WithValues(append([]any{
 		"Node", klog.KObj(candidate.Node),
 		"NodeClaim", klog.KObj(candidate.NodeClaim),
@@ -472,40 +457,6 @@ func (r *Repair) logRepairPolicyDecisions(ctx context.Context, node *corev1.Node
 			"Node", klog.KObj(node),
 		}, values...)...).Info("evaluated repair policy")
 	}
-}
-
-func (r *Repair) recordRepairPolicyDecisionLog(node *corev1.Node, fingerprint string, now time.Time) bool {
-	key := node.UID
-	if key == "" {
-		key = types.UID(node.Name)
-	}
-	r.decisionLogsMu.Lock()
-	defer r.decisionLogsMu.Unlock()
-	if r.decisionLogs == nil {
-		r.decisionLogs = make(map[types.UID]repairDecisionLogState)
-	}
-	if r.nextDecisionLogPrune.IsZero() || !now.Before(r.nextDecisionLogPrune) {
-		cutoff := now.Add(-repairDecisionLogRetention)
-		for uid, state := range r.decisionLogs {
-			if state.lastSeen.Before(cutoff) {
-				delete(r.decisionLogs, uid)
-			}
-		}
-		r.nextDecisionLogPrune = now.Add(repairDecisionLogPruneInterval)
-	}
-	previous, ok := r.decisionLogs[key]
-	r.decisionLogs[key] = repairDecisionLogState{fingerprint: fingerprint, lastSeen: now}
-	return !ok || previous.fingerprint != fingerprint
-}
-
-func (r *Repair) clearRepairPolicyDecisionLog(node *corev1.Node) {
-	key := node.UID
-	if key == "" {
-		key = types.UID(node.Name)
-	}
-	r.decisionLogsMu.Lock()
-	defer r.decisionLogsMu.Unlock()
-	delete(r.decisionLogs, key)
 }
 
 // effectiveDrainBound returns the drain bound for the candidate, carried on the Command and applied by the queue

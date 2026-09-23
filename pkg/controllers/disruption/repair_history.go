@@ -75,13 +75,9 @@ func (h *RebootHistory) RecordCommittedReboot(nodeClaimUID types.UID) {
 	h.recent.SetDefault(key, entry)
 }
 
-// Resolve applies active lifecycle state and recent reboot history to current eligible results, storing the resolved
-// decision on the existing disruption candidate.
-func (h *RebootHistory) Resolve(candidate *Candidate, activeRebootLifecycle bool, results []RepairResult) bool {
-	if activeRebootLifecycle {
-		clearRepairResolution(candidate)
-		return false
-	}
+// Resolve applies recent reboot history to current eligible results, storing the resolved decision on the existing
+// disruption candidate.
+func (h *RebootHistory) Resolve(candidate *Candidate, results []RepairResult) bool {
 	resolvedResults, rebootEscalated := resolveRepairActions(h.committedReboots(candidate.NodeClaim.UID), results)
 	if !resolveRepairCandidate(candidate, resolvedResults) {
 		return false

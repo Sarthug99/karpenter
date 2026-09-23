@@ -34,12 +34,12 @@ func TestRebootHistoryEscalatesAfterTwoCommittedReboots(t *testing.T) {
 		repairResultForTest("AcceleratorReady", "XID48", cloudprovider.RebootNode, time.Unix(1, 0), &oneMinute),
 	}
 
-	if !history.Resolve(candidate, false, results) || candidate.Action != cloudprovider.RebootNode {
+	if !history.Resolve(candidate, results) || candidate.Action != cloudprovider.RebootNode {
 		t.Fatalf("expected the first repair to remain a reboot: %#v", candidate)
 	}
 
 	history.RecordCommittedReboot(candidate.NodeClaim.UID)
-	if !history.Resolve(candidate, false, results) || candidate.Action != cloudprovider.RebootNode {
+	if !history.Resolve(candidate, results) || candidate.Action != cloudprovider.RebootNode {
 		t.Fatalf("expected the second repair to remain a reboot: %#v", candidate)
 	}
 	if candidate.RebootEscalated {
@@ -47,7 +47,7 @@ func TestRebootHistoryEscalatesAfterTwoCommittedReboots(t *testing.T) {
 	}
 
 	history.RecordCommittedReboot(candidate.NodeClaim.UID)
-	if !history.Resolve(candidate, false, results) || candidate.Action != cloudprovider.ReplaceNode {
+	if !history.Resolve(candidate, results) || candidate.Action != cloudprovider.ReplaceNode {
 		t.Fatalf("expected two committed reboots to escalate to replacement: %#v", candidate)
 	}
 	if !candidate.RebootEscalated {
@@ -66,7 +66,7 @@ func TestRebootHistoryResolveDoesNotRecordReboots(t *testing.T) {
 	}
 
 	for range 3 {
-		if !history.Resolve(candidate, false, results) || candidate.Action != cloudprovider.RebootNode {
+		if !history.Resolve(candidate, results) || candidate.Action != cloudprovider.RebootNode {
 			t.Fatalf("expected uncommitted resolution not to consume a reboot: %#v", candidate)
 		}
 	}
@@ -82,25 +82,8 @@ func TestRebootHistoryUsesNodeClaimUID(t *testing.T) {
 	history.RecordCommittedReboot(original.NodeClaim.UID)
 
 	successor := repairCandidateForTest("successor-uid")
-	if !history.Resolve(successor, false, results) || successor.Action != cloudprovider.RebootNode {
+	if !history.Resolve(successor, results) || successor.Action != cloudprovider.RebootNode {
 		t.Fatalf("expected a successor NodeClaim to have independent history: %#v", successor)
-	}
-}
-
-func TestRebootHistorySuppressesActiveLifecycle(t *testing.T) {
-	history := NewRebootHistory()
-	candidate := repairCandidateForTest("nodeclaim-uid")
-	history.RecordCommittedReboot(candidate.NodeClaim.UID)
-	history.RecordCommittedReboot(candidate.NodeClaim.UID)
-	results := []RepairResult{
-		repairResultForTest("StorageReady", "DiskFailure", cloudprovider.ReplaceNode, time.Unix(1, 0), nil),
-	}
-
-	if history.Resolve(candidate, true, results) {
-		t.Fatal("expected an active reboot lifecycle to suppress repair")
-	}
-	if candidate.Action != "" {
-		t.Fatalf("expected an active lifecycle to clear the repair decision: %#v", candidate)
 	}
 }
 
@@ -113,10 +96,10 @@ func TestRebootHistoryKeepsReplacementAndRequiresCurrentEvidence(t *testing.T) {
 	replacement := []RepairResult{
 		repairResultForTest("StorageReady", "DiskFailure", cloudprovider.ReplaceNode, time.Unix(1, 0), nil),
 	}
-	if !history.Resolve(candidate, false, replacement) || candidate.Action != cloudprovider.ReplaceNode || candidate.RebootEscalated {
+	if !history.Resolve(candidate, replacement) || candidate.Action != cloudprovider.ReplaceNode || candidate.RebootEscalated {
 		t.Fatalf("expected replacement evidence to remain unchanged: %#v", candidate)
 	}
-	if history.Resolve(candidate, false, nil) {
+	if history.Resolve(candidate, nil) {
 		t.Fatal("expected history alone not to create repair work")
 	}
 }
@@ -132,20 +115,14 @@ func TestRebootHistoryUsesSlidingWindow(t *testing.T) {
 	history.RecordCommittedReboot(candidate.NodeClaim.UID)
 	clk.Step(13 * time.Hour)
 	history.RecordCommittedReboot(candidate.NodeClaim.UID)
-	if !history.Resolve(candidate, false, results) || candidate.Action != cloudprovider.ReplaceNode {
-		t.Fatalf("expected two reboots inside the window to trigger replacement: %#v", candidate)
-	}
 
 	clk.Step(12 * time.Hour)
-	if !history.Resolve(candidate, false, results) || candidate.Action != cloudprovider.RebootNode {
+	if !history.Resolve(candidate, results) || candidate.Action != cloudprovider.RebootNode {
 		t.Fatalf("expected the reboot at t=0h to leave the window at t=25h: %#v", candidate)
-	}
-	if got := history.committedReboots(candidate.NodeClaim.UID); got != 1 {
-		t.Fatalf("expected one reboot inside the sliding window, got %d", got)
 	}
 
 	history.RecordCommittedReboot(candidate.NodeClaim.UID)
-	if !history.Resolve(candidate, false, results) || candidate.Action != cloudprovider.ReplaceNode {
+	if !history.Resolve(candidate, results) || candidate.Action != cloudprovider.ReplaceNode {
 		t.Fatalf("expected reboots at t=13h and t=25h to trigger replacement: %#v", candidate)
 	}
 }

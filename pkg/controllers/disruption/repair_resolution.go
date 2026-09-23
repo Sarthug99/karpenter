@@ -104,13 +104,7 @@ func repairResultLess(lhs, rhs RepairResult) bool {
 	if !lhs.EligibleAt.Equal(rhs.EligibleAt) {
 		return lhs.EligibleAt.Before(rhs.EligibleAt)
 	}
-	if lhs.ConditionType != rhs.ConditionType {
-		return lhs.ConditionType < rhs.ConditionType
-	}
-	if lhs.ConditionStatus != rhs.ConditionStatus {
-		return lhs.ConditionStatus < rhs.ConditionStatus
-	}
-	return lhs.Reason < rhs.Reason
+	return lhs.ConditionType < rhs.ConditionType
 }
 
 func repairConditionFor(result RepairResult) RepairEvidence {

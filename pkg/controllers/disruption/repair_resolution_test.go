@@ -76,14 +76,24 @@ func TestResolveRepairCandidate(t *testing.T) {
 
 func TestResolveRepairCandidateClearsStaleDecision(t *testing.T) {
 	candidate := repairCandidateForTest("nodeclaim-uid")
+	drainBound := time.Minute
+	drainBoundCondition := RepairEvidence{Type: "DrainBound", Status: corev1.ConditionFalse, Reason: "Forceful"}
 	candidate.Action = cloudprovider.ReplaceNode
-	candidate.RepairCondition = RepairEvidence{Type: "BadNode"}
-	candidate.TerminationGracePeriod = new(time.Duration)
+	candidate.RepairEligibleAt = time.Unix(1, 0)
+	candidate.RepairCondition = RepairEvidence{Type: "BadNode", Status: corev1.ConditionFalse, Reason: "Persistent"}
+	candidate.RebootEscalated = true
+	candidate.TerminationGracePeriod = &drainBound
+	candidate.TerminationGracePeriodCondition = &drainBoundCondition
 
 	if resolveRepairCandidate(candidate, nil) {
 		t.Fatal("expected no candidate without eligible results")
 	}
-	if candidate.Action != "" || candidate.RepairCondition.Type != "" || candidate.TerminationGracePeriod != nil {
+	if candidate.Action != "" ||
+		!candidate.RepairEligibleAt.IsZero() ||
+		candidate.RepairCondition != (RepairEvidence{}) ||
+		candidate.RebootEscalated ||
+		candidate.TerminationGracePeriod != nil ||
+		candidate.TerminationGracePeriodCondition != nil {
 		t.Fatalf("expected stale repair decision to be cleared: %#v", candidate)
 	}
 }
@@ -110,30 +120,67 @@ func TestResolveRepairCandidatePreservesForcefulDrain(t *testing.T) {
 
 func TestSameRepairResolution(t *testing.T) {
 	drainBound := 10 * time.Minute
+	drainBoundCondition := RepairEvidence{Type: "DrainBound", Status: corev1.ConditionFalse, Reason: "Forceful"}
 	resolved := repairCandidateForTest("nodeclaim-uid")
 	resolved.Action = cloudprovider.ReplaceNode
 	resolved.RepairEligibleAt = time.Unix(1, 0)
 	resolved.RepairCondition = RepairEvidence{Type: "BadNode", Status: corev1.ConditionFalse, Reason: "Persistent"}
+	resolved.RebootEscalated = true
 	resolved.TerminationGracePeriod = &drainBound
+	resolved.TerminationGracePeriodCondition = &drainBoundCondition
 
-	unchanged := *resolved
-	unchangedDrainBound := drainBound
-	unchanged.TerminationGracePeriod = &unchangedDrainBound
-	if !sameRepairResolution(resolved, &unchanged) {
+	if !sameRepairResolution(resolved, cloneRepairCandidateForTest(resolved)) {
 		t.Fatal("expected equivalent repair resolutions to match")
 	}
 
-	changedCondition := unchanged
-	changedCondition.RepairCondition = RepairEvidence{Type: "WorseNode", Status: corev1.ConditionFalse, Reason: "Urgent"}
-	if sameRepairResolution(resolved, &changedCondition) {
-		t.Fatal("expected a changed driving condition to invalidate the scheduling result")
+	tests := []struct {
+		name   string
+		mutate func(*Candidate)
+	}{
+		{
+			name:   "node UID",
+			mutate: func(candidate *Candidate) { candidate.Node.UID = "changed-node-uid" },
+		},
+		{
+			name:   "NodeClaim UID",
+			mutate: func(candidate *Candidate) { candidate.NodeClaim.UID = "changed-nodeclaim-uid" },
+		},
+		{
+			name:   "action",
+			mutate: func(candidate *Candidate) { candidate.Action = cloudprovider.RebootNode },
+		},
+		{
+			name:   "eligibility",
+			mutate: func(candidate *Candidate) { candidate.RepairEligibleAt = candidate.RepairEligibleAt.Add(time.Second) },
+		},
+		{
+			name: "driving condition",
+			mutate: func(candidate *Candidate) {
+				candidate.RepairCondition = RepairEvidence{Type: "WorseNode", Status: corev1.ConditionFalse, Reason: "Urgent"}
+			},
+		},
+		{
+			name:   "reboot escalation",
+			mutate: func(candidate *Candidate) { candidate.RebootEscalated = false },
+		},
+		{
+			name:   "drain bound",
+			mutate: func(candidate *Candidate) { candidate.TerminationGracePeriod = nil },
+		},
+		{
+			name:   "drain-bound condition",
+			mutate: func(candidate *Candidate) { candidate.TerminationGracePeriodCondition = nil },
+		},
 	}
 
-	changedDrainBound := unchanged
-	shorterDrainBound := 2 * time.Minute
-	changedDrainBound.TerminationGracePeriod = &shorterDrainBound
-	if sameRepairResolution(resolved, &changedDrainBound) {
-		t.Fatal("expected a changed drain bound to invalidate the scheduling result")
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			changed := cloneRepairCandidateForTest(resolved)
+			test.mutate(changed)
+			if sameRepairResolution(resolved, changed) {
+				t.Fatalf("expected changed %s to invalidate the scheduling result", test.name)
+			}
+		})
 	}
 }
 
@@ -144,6 +191,23 @@ func repairCandidateForTest(nodeClaimUID types.UID) *Candidate {
 			NodeClaim: &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "nodeclaim", UID: nodeClaimUID}},
 		},
 	}
+}
+
+func cloneRepairCandidateForTest(candidate *Candidate) *Candidate {
+	cloned := *candidate
+	stateNode := *candidate.StateNode
+	stateNode.Node = candidate.Node.DeepCopy()
+	stateNode.NodeClaim = candidate.NodeClaim.DeepCopy()
+	cloned.StateNode = &stateNode
+	if candidate.TerminationGracePeriod != nil {
+		drainBound := *candidate.TerminationGracePeriod
+		cloned.TerminationGracePeriod = &drainBound
+	}
+	if candidate.TerminationGracePeriodCondition != nil {
+		condition := *candidate.TerminationGracePeriodCondition
+		cloned.TerminationGracePeriodCondition = &condition
+	}
+	return &cloned
 }
 
 func repairResultForTest(
