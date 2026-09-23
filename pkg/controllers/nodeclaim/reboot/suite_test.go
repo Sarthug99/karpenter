@@ -230,6 +230,18 @@ var _ = Describe("Reboot Lifecycle", func() {
 			Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).Reason).To(Equal(v1.RebootReasonRequested))
 		})
 
+		It("issues a forceful reboot (0s drain-grace-period) immediately even with a pod present", func() {
+			// The default drain-grace-period is "0s" (forceful): the reboot issues in a single reconcile
+			// even with a drainable pod present, unlike the bounded-drain case above which requeues.
+			pod := test.Pod(test.PodOptions{NodeName: node.Name})
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node, pod)
+			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
+
+			Expect(cloudProvider.RebootCalls).To(HaveLen(1))
+			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+			Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).Reason).To(Equal(v1.RebootReasonIssued))
+		})
+
 		It("fails with provider_error when issuance does not succeed within the issuance timeout", func() {
 			// Simulate a reboot stuck in the post-drain provider-accept loop.
 			nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{
