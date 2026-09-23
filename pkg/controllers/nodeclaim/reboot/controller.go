@@ -269,9 +269,8 @@ func (c *Controller) transitionToSucceeded(ctx context.Context, nodeClaim *v1.No
 	if issuedAt, ok := c.issuedAt(nodeClaim); ok {
 		recovery, hasRecovery = c.clock.Since(issuedAt), true
 	}
-	res, err := c.setTerminal(ctx, nodeClaim, v1.RebootReasonSucceeded, "node rebooted and rejoined the cluster")
-	if err != nil {
-		return res, err
+	if err := c.setTerminal(ctx, nodeClaim, v1.RebootReasonSucceeded, "node rebooted and rejoined the cluster"); err != nil {
+		return reconcile.Result{}, err
 	}
 	// Record events/metrics only after the terminal patch is durable, so a patch-conflict requeue can't
 	// re-enter this branch and double-count.
@@ -282,7 +281,7 @@ func (c *Controller) transitionToSucceeded(ctx context.Context, nodeClaim *v1.No
 		// reboot never recovered, so it has no recovery time (this is why it's not observed on failure).
 		RebootRecoveryDurationSeconds.Observe(recovery.Seconds(), map[string]string{})
 	}
-	return res, nil
+	return reconcile.Result{}, nil
 }
 
 func (c *Controller) transitionToFailed(ctx context.Context, nodeClaim *v1.NodeClaim, node *corev1.Node, result, msg string) (reconcile.Result, error) {
@@ -295,17 +294,16 @@ func (c *Controller) transitionToFailed(ctx context.Context, nodeClaim *v1.NodeC
 	}
 	// Capture duration before setTerminal resets the Rebooting condition's transition time.
 	duration := c.clock.Since(rebootRequestedAt(nodeClaim))
-	res, err := c.setTerminal(ctx, nodeClaim, v1.RebootReasonFailed, msg)
-	if err != nil {
-		return res, err
+	if err := c.setTerminal(ctx, nodeClaim, v1.RebootReasonFailed, msg); err != nil {
+		return reconcile.Result{}, err
 	}
 	// Record events/metrics only after the terminal patch is durable (see transitionToSucceeded).
 	c.recorder.Publish(rebootevents.RebootFailed(nodeClaim, msg))
 	recordTerminalMetrics(result, duration)
-	return res, nil
+	return reconcile.Result{}, nil
 }
 
-func (c *Controller) setTerminal(ctx context.Context, nodeClaim *v1.NodeClaim, reason, msg string) (reconcile.Result, error) {
+func (c *Controller) setTerminal(ctx context.Context, nodeClaim *v1.NodeClaim, reason, msg string) error {
 	// Clear episode-scoped reboot state (metadata) first, so a later reboot on this NodeClaim starts clean
 	// and the restart-safety check can't misfire on a prior episode's pre-boot bootID.
 	stored := nodeClaim.DeepCopy()
@@ -315,18 +313,18 @@ func (c *Controller) setTerminal(ctx context.Context, nodeClaim *v1.NodeClaim, r
 		delete(nodeClaim.Annotations, v1.RebootPreBootIDAnnotationKey)
 		delete(nodeClaim.Annotations, v1.RebootIssuanceStartedAtAnnotationKey)
 		if err := c.kubeClient.Patch(ctx, nodeClaim, client.MergeFrom(stored)); err != nil {
-			return reconcile.Result{}, err
+			return err
 		}
 	}
 	stored = nodeClaim.DeepCopy()
 	nodeClaim.StatusConditions().SetFalse(v1.ConditionTypeRebooting, reason, msg)
 	if !equality.Semantic.DeepEqual(stored, nodeClaim) {
 		if err := c.kubeClient.Status().Patch(ctx, nodeClaim, client.MergeFrom(stored)); err != nil {
-			return reconcile.Result{}, err
+			return err
 		}
 	}
 	log.FromContext(ctx).WithValues("reason", reason).Info("reboot reached terminal outcome")
-	return reconcile.Result{}, nil
+	return nil
 }
 
 func (c *Controller) ensureRebootTaint(ctx context.Context, node *corev1.Node) error {
