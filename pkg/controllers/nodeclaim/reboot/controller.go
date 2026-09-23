@@ -258,13 +258,26 @@ func (c *Controller) transitionToSucceeded(ctx context.Context, nodeClaim *v1.No
 	if err := c.removeRebootTaint(ctx, node); err != nil {
 		return reconcile.Result{}, err
 	}
-	c.recorder.Publish(rebootevents.Succeeded(nodeClaim))
-	c.recordTerminalMetrics(nodeClaim, resultSucceeded)
-	// Recovery duration (drain-independent): issuance -> new boot rejoined. Success only.
+	// Capture durations before setTerminal resets the Rebooting condition's transition time.
+	duration := c.clock.Since(rebootRequestedAt(nodeClaim))
+	recovery, hasRecovery := time.Duration(0), false
 	if issuedAt, ok := c.issuedAt(nodeClaim); ok {
-		RebootRecoveryDurationSeconds.Observe(c.clock.Since(issuedAt).Seconds(), map[string]string{})
+		recovery, hasRecovery = c.clock.Since(issuedAt), true
 	}
-	return c.setTerminal(ctx, nodeClaim, v1.RebootReasonSucceeded, "node rebooted and rejoined the cluster")
+	res, err := c.setTerminal(ctx, nodeClaim, v1.RebootReasonSucceeded, "node rebooted and rejoined the cluster")
+	if err != nil {
+		return res, err
+	}
+	// Record events/metrics only after the terminal patch is durable, so a patch-conflict requeue can't
+	// re-enter this branch and double-count.
+	c.recorder.Publish(rebootevents.Succeeded(nodeClaim))
+	recordTerminalMetrics(resultSucceeded, duration)
+	if hasRecovery {
+		// Recovery duration (drain-independent): issuance -> new boot rejoined. Success only — a timed-out
+		// reboot never recovered, so it has no recovery time (this is why it's not observed on failure).
+		RebootRecoveryDurationSeconds.Observe(recovery.Seconds(), map[string]string{})
+	}
+	return res, nil
 }
 
 func (c *Controller) transitionToFailed(ctx context.Context, nodeClaim *v1.NodeClaim, node *corev1.Node, result, msg string) (reconcile.Result, error) {
@@ -275,9 +288,16 @@ func (c *Controller) transitionToFailed(ctx context.Context, nodeClaim *v1.NodeC
 			return reconcile.Result{}, err
 		}
 	}
+	// Capture duration before setTerminal resets the Rebooting condition's transition time.
+	duration := c.clock.Since(rebootRequestedAt(nodeClaim))
+	res, err := c.setTerminal(ctx, nodeClaim, v1.RebootReasonFailed, msg)
+	if err != nil {
+		return res, err
+	}
+	// Record events/metrics only after the terminal patch is durable (see transitionToSucceeded).
 	c.recorder.Publish(rebootevents.Failed(nodeClaim, msg))
-	c.recordTerminalMetrics(nodeClaim, result)
-	return c.setTerminal(ctx, nodeClaim, v1.RebootReasonFailed, msg)
+	recordTerminalMetrics(result, duration)
+	return res, nil
 }
 
 func (c *Controller) setTerminal(ctx context.Context, nodeClaim *v1.NodeClaim, reason, msg string) (reconcile.Result, error) {
@@ -407,9 +427,9 @@ func rebootOperationID(nodeClaim *v1.NodeClaim) string {
 }
 
 // recordTerminalMetrics counts the reboot by result and observes the full-action duration (request ->
-// terminal). Must be called while the Rebooting condition is still True (before setTerminal resets its
-// transition time).
-func (c *Controller) recordTerminalMetrics(nodeClaim *v1.NodeClaim, result string) {
+// terminal). Called only after the terminal condition patch succeeds, so a patch-conflict requeue cannot
+// re-enter the terminal branch and double-count.
+func recordTerminalMetrics(result string, duration time.Duration) {
 	RebootsTotal.Inc(map[string]string{resultLabel: result})
-	RebootDurationSeconds.Observe(c.clock.Since(rebootRequestedAt(nodeClaim)).Seconds(), map[string]string{resultLabel: result})
+	RebootDurationSeconds.Observe(duration.Seconds(), map[string]string{resultLabel: result})
 }
