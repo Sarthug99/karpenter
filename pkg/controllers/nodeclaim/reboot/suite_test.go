@@ -90,6 +90,9 @@ var _ = Describe("Reboot Lifecycle", func() {
 		node.Labels[v1.NodePoolLabelKey] = nodePool.Name
 		node.Labels[v1.NodeInitializedLabelKey] = "true"
 		node.Status.NodeInfo.BootID = "boot-1"
+		// A committed reboot request always carries a valid drain-grace-period; 0s = forceful.
+		nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{v1.RebootDrainGracePeriodAnnotationKey: "0s"})
+		nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeInitialized)
 		nodeClaim.StatusConditions().SetTrueWithReason(v1.ConditionTypeRebooting, v1.RebootReasonRequested, "reboot requested")
 	})
 
@@ -99,6 +102,15 @@ var _ = Describe("Reboot Lifecycle", func() {
 
 	hasRebootTaint := func(n *corev1.Node) bool {
 		return lo.ContainsBy(n.Spec.Taints, func(t corev1.Taint) bool { return t.MatchTaint(&v1.RebootingNoScheduleTaint) })
+	}
+
+	expectInvalidRequest := func(nc *v1.NodeClaim) {
+		nc = ExpectExists(ctx, env.Client, nc)
+		cond := nc.StatusConditions().Get(v1.ConditionTypeRebooting)
+		Expect(cond.IsFalse()).To(BeTrue())
+		Expect(cond.Reason).To(Equal(v1.RebootReasonFailed))
+		Expect(cloudProvider.RebootCalls).To(BeEmpty()) // never issued — failed on the invalid request
+		ExpectMetricCounterValue(reboot.RebootsTotal, 1, map[string]string{"result": "invalid_request"})
 	}
 
 	Context("RebootRequested", func() {
@@ -114,8 +126,10 @@ var _ = Describe("Reboot Lifecycle", func() {
 			Expect(cond.Reason).To(Equal(v1.RebootReasonIssued))
 			Expect(nodeClaim.Annotations).To(HaveKeyWithValue(v1.RebootPreBootIDAnnotationKey, "boot-1"))
 			Expect(cloudProvider.RebootOperationIDs[0]).ToNot(BeEmpty())
-			// Initialization is invalidated by a committed reboot until the node re-initializes.
-			Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized).Status).To(Equal(metav1.ConditionUnknown))
+			// A committed reboot invalidates Initialized (True -> Unknown) until the node re-initializes.
+			initialized := nodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized)
+			Expect(initialized.Status).To(Equal(metav1.ConditionUnknown))
+			Expect(initialized.Reason).To(Equal(v1.RebootReasonRequested))
 
 			node = ExpectExists(ctx, env.Client, node)
 			Expect(hasRebootTaint(node)).To(BeTrue())
@@ -233,6 +247,27 @@ var _ = Describe("Reboot Lifecycle", func() {
 			Expect(cloudProvider.RebootCalls).To(BeEmpty()) // failed at the deadline, never re-issued
 			Expect(recorder.Calls(events.RebootFailed)).To(Equal(1))
 			ExpectMetricCounterValue(reboot.RebootsTotal, 1, map[string]string{"result": "provider_error"})
+		})
+
+		It("fails with invalid_request when the drain-grace-period is missing", func() {
+			delete(nodeClaim.Annotations, v1.RebootDrainGracePeriodAnnotationKey)
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
+			expectInvalidRequest(nodeClaim)
+		})
+
+		It("fails with invalid_request when the drain-grace-period is malformed", func() {
+			nodeClaim.Annotations[v1.RebootDrainGracePeriodAnnotationKey] = "5min"
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
+			expectInvalidRequest(nodeClaim)
+		})
+
+		It("fails with invalid_request when the drain-grace-period is negative", func() {
+			nodeClaim.Annotations[v1.RebootDrainGracePeriodAnnotationKey] = "-5m"
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
+			expectInvalidRequest(nodeClaim)
 		})
 	})
 

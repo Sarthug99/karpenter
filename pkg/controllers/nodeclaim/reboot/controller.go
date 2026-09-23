@@ -139,6 +139,12 @@ func (c *Controller) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (re
 
 // reconcileRequested applies the scheduling fence, drains (bounded), then issues the provider reboot.
 func (c *Controller) reconcileRequested(ctx context.Context, nodeClaim *v1.NodeClaim, node *corev1.Node) (reconcile.Result, error) {
+	// A committed reboot request must carry a valid drain bound; reject an invalid one terminally rather
+	// than defaulting to a (possibly destructive) forceful reboot.
+	dgp, err := drainGracePeriod(nodeClaim)
+	if err != nil {
+		return c.transitionToFailed(ctx, nodeClaim, node, resultInvalidRequest, fmt.Sprintf("invalid reboot request: %v", err))
+	}
 	c.recorder.Publish(rebootevents.Requested(nodeClaim))
 	// Scheduling fence: reboot-owned taint that keeps evicted pods from rescheduling onto the pre-reboot boot.
 	if err := c.ensureRebootTaint(ctx, node); err != nil {
@@ -154,7 +160,7 @@ func (c *Controller) reconcileRequested(ctx context.Context, nodeClaim *v1.NodeC
 
 	// Drain before issuing (only before we've recorded pre-boot state; on resume after that, skip drain).
 	if !issuing {
-		if done, res, err := c.drain(ctx, nodeClaim, node); err != nil || !done {
+		if done, res, err := c.drain(ctx, nodeClaim, node, dgp); err != nil || !done {
 			return res, err
 		}
 		// Record pre-boot state before the first provider call.
@@ -200,8 +206,7 @@ func (c *Controller) reconcileIssued(ctx context.Context, nodeClaim *v1.NodeClai
 // drain runs a bounded graceful drain (eviction only, no cordon). Returns done=true when the drain
 // completes or the drainGracePeriod deadline elapses (residual pods ride the reboot). drainGracePeriod=0
 // skips the drain entirely (forceful).
-func (c *Controller) drain(ctx context.Context, nodeClaim *v1.NodeClaim, node *corev1.Node) (done bool, res reconcile.Result, err error) {
-	dgp := c.drainGracePeriod(nodeClaim)
+func (c *Controller) drain(ctx context.Context, nodeClaim *v1.NodeClaim, node *corev1.Node, dgp time.Duration) (done bool, res reconcile.Result, err error) {
 	if dgp <= 0 {
 		return true, reconcile.Result{}, nil
 	}
@@ -351,12 +356,23 @@ func (c *Controller) removeInitializedLabel(ctx context.Context, node *corev1.No
 	return c.kubeClient.Patch(ctx, node, client.MergeFrom(stored))
 }
 
-func (c *Controller) drainGracePeriod(nodeClaim *v1.NodeClaim) time.Duration {
-	d, err := time.ParseDuration(nodeClaim.Annotations[v1.RebootDrainGracePeriodAnnotationKey])
-	if err != nil {
-		return 0
+// drainGracePeriod reads the consumer-stamped drain bound. A committed reboot request must carry a valid,
+// non-negative value: 0s = forceful (skip drain), >0 = graceful-bounded. Missing, malformed, or negative
+// is a producer contract violation (0s already means forceful), so it's an error the caller fails
+// terminally rather than silently selecting the most disruptive behavior.
+func drainGracePeriod(nodeClaim *v1.NodeClaim) (time.Duration, error) {
+	value, ok := nodeClaim.Annotations[v1.RebootDrainGracePeriodAnnotationKey]
+	if !ok {
+		return 0, fmt.Errorf("drain-grace-period annotation is missing")
 	}
-	return d
+	d, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("parsing drain-grace-period %q: %w", value, err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("drain-grace-period must be non-negative, got %q", value)
+	}
+	return d, nil
 }
 
 // issuedAt derives the issuance time from the Initialized condition, which transitions to Unknown exactly
@@ -381,12 +397,15 @@ func (c *Controller) issuanceStartedAt(nodeClaim *v1.NodeClaim) (time.Time, bool
 // rebootDeadline is the wall-clock bound for the current phase, after which the reboot is failed. It is
 // derived only from the NodeClaim (never the Node), so it fires even when the Node has been deleted.
 func (c *Controller) rebootDeadline(nodeClaim *v1.NodeClaim) time.Time {
+	// An invalid drain-grace-period is failed terminally in reconcileRequested; here we only need a bound,
+	// so treat an unparseable/absent value as 0 for the fallback budget.
+	dgp, _ := drainGracePeriod(nodeClaim)
 	if nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).Reason == v1.RebootReasonIssued {
 		if issuedAt, ok := c.issuedAt(nodeClaim); ok {
 			return issuedAt.Add(observationWindow)
 		}
 		// Fallback if issuedAt isn't derivable: the full request budget plus the observation window.
-		return rebootRequestedAt(nodeClaim).Add(c.drainGracePeriod(nodeClaim) + issuanceTimeout + observationWindow)
+		return rebootRequestedAt(nodeClaim).Add(dgp + issuanceTimeout + observationWindow)
 	}
 	// RebootRequested: once issuing, bound the provider-accept loop from drain-completion. Before drain
 	// completes, fall back to the full request budget (drain + issuance) so a wedge during drain — e.g. a
@@ -394,7 +413,7 @@ func (c *Controller) rebootDeadline(nodeClaim *v1.NodeClaim) time.Time {
 	if startedAt, ok := c.issuanceStartedAt(nodeClaim); ok {
 		return startedAt.Add(issuanceTimeout)
 	}
-	return rebootRequestedAt(nodeClaim).Add(c.drainGracePeriod(nodeClaim) + issuanceTimeout)
+	return rebootRequestedAt(nodeClaim).Add(dgp + issuanceTimeout)
 }
 
 func (c *Controller) pastRebootDeadline(nodeClaim *v1.NodeClaim) bool {

@@ -32,6 +32,7 @@ const (
 	resultSucceeded       = "succeeded"
 	resultProviderError   = "provider_error"
 	resultRecoveryTimeout = "recovery_timeout"
+	resultInvalidRequest  = "invalid_request"
 )
 
 // Result is the terminal-outcome dimension shared by every reboot metric.
@@ -42,6 +43,7 @@ var Result = opmetrics.Label{
 		{Name: resultSucceeded, Help: "The node rebooted and rejoined the cluster (bootID changed + Ready)."},
 		{Name: resultProviderError, Help: "The cloud provider rejected the reboot with a terminal error."},
 		{Name: resultRecoveryTimeout, Help: "The node did not prove a new boot and rejoin within the observation window."},
+		{Name: resultInvalidRequest, Help: "The committed reboot request was invalid (missing, malformed, or negative drain grace period)."},
 	},
 }
 
