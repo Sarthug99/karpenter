@@ -145,7 +145,7 @@ func (c *Controller) reconcileRequested(ctx context.Context, nodeClaim *v1.NodeC
 	if err != nil {
 		return c.transitionToFailed(ctx, nodeClaim, node, resultInvalidRequest, fmt.Sprintf("invalid reboot request: %v", err))
 	}
-	c.recorder.Publish(rebootevents.Requested(nodeClaim))
+	c.recorder.Publish(rebootevents.RebootRequested(nodeClaim))
 	// Scheduling fence: reboot-owned taint that keeps evicted pods from rescheduling onto the pre-reboot boot.
 	if err := c.ensureRebootTaint(ctx, node); err != nil {
 		return reconcile.Result{}, err
@@ -192,7 +192,7 @@ func (c *Controller) reconcileIssued(ctx context.Context, nodeClaim *v1.NodeClai
 		if err := c.removeRebootTaint(ctx, node); err != nil {
 			return reconcile.Result{}, err
 		}
-		c.recorder.Publish(rebootevents.Observed(nodeClaim))
+		c.recorder.Publish(rebootevents.RebootObserved(nodeClaim))
 	}
 
 	ready := nodeutils.GetCondition(node, corev1.NodeReady).Status == corev1.ConditionTrue
@@ -255,7 +255,7 @@ func (c *Controller) transitionToIssued(ctx context.Context, nodeClaim *v1.NodeC
 	if err := c.removeInitializedLabel(ctx, node); err != nil {
 		return reconcile.Result{}, err
 	}
-	c.recorder.Publish(rebootevents.Issued(nodeClaim))
+	c.recorder.Publish(rebootevents.RebootIssued(nodeClaim))
 	return reconcile.Result{RequeueAfter: pollInterval}, nil
 }
 
@@ -275,7 +275,7 @@ func (c *Controller) transitionToSucceeded(ctx context.Context, nodeClaim *v1.No
 	}
 	// Record events/metrics only after the terminal patch is durable, so a patch-conflict requeue can't
 	// re-enter this branch and double-count.
-	c.recorder.Publish(rebootevents.Succeeded(nodeClaim))
+	c.recorder.Publish(rebootevents.RebootSucceeded(nodeClaim))
 	recordTerminalMetrics(resultSucceeded, duration)
 	if hasRecovery {
 		// Recovery duration (drain-independent): issuance -> new boot rejoined. Success only — a timed-out
@@ -300,7 +300,7 @@ func (c *Controller) transitionToFailed(ctx context.Context, nodeClaim *v1.NodeC
 		return res, err
 	}
 	// Record events/metrics only after the terminal patch is durable (see transitionToSucceeded).
-	c.recorder.Publish(rebootevents.Failed(nodeClaim, msg))
+	c.recorder.Publish(rebootevents.RebootFailed(nodeClaim, msg))
 	recordTerminalMetrics(result, duration)
 	return res, nil
 }
