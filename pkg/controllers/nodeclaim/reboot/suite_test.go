@@ -230,14 +230,31 @@ var _ = Describe("Reboot Lifecycle", func() {
 			Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).Reason).To(Equal(v1.RebootReasonRequested))
 		})
 
-		It("issues a forceful reboot (0s drain-grace-period) immediately even with a pod present", func() {
-			// The default drain-grace-period is "0s" (forceful): the reboot issues in a single reconcile
-			// even with a drainable pod present, unlike the bounded-drain case above which requeues.
+		It("makes a minDrainTime graceful pass on a forceful (0s) reboot when a pod is present", func() {
+			// Even a forceful (0s) reboot drains for at least minDrainTime: a pod that bound after the fence
+			// taint but before scheduler informers synced is evicted gracefully rather than riding the reboot.
+			// So with a drainable pod present the reboot does NOT issue in the first reconcile; it requeues.
 			pod := test.Pod(test.PodOptions{NodeName: node.Name})
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node, pod)
+			result := ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
+
+			Expect(cloudProvider.RebootCalls).To(BeEmpty()) // draining, not yet issued
+			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+			Expect(result.RequeueAfter).To(BeNumerically("<=", 5*time.Second)) // bounded by minDrainTime
+			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+			Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).Reason).To(Equal(v1.RebootReasonRequested))
+		})
+
+		It("issues a forceful (0s) reboot after the minDrainTime window elapses with a pod present", func() {
+			pod := test.Pod(test.PodOptions{NodeName: node.Name})
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node, pod)
+			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim) // first pass: draining
+			Expect(cloudProvider.RebootCalls).To(BeEmpty())
+
+			env.Clock.Step(6 * time.Second) // past the minDrainTime floor
 			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
 
-			Expect(cloudProvider.RebootCalls).To(HaveLen(1))
+			Expect(cloudProvider.RebootCalls).To(HaveLen(1)) // residual pod rides the reboot
 			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
 			Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).Reason).To(Equal(v1.RebootReasonIssued))
 		})

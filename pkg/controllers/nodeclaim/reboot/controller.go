@@ -61,6 +61,11 @@ const (
 	// issuanceTimeout bounds the post-drain provider-accept retry loop before declaring RebootFailed.
 	// Mirrors nodeclaim lifecycle's LaunchTimeout: a provider control-plane call should complete within it.
 	issuanceTimeout = 5 * time.Minute
+	// minDrainTime is the floor on the graceful drain window, applied even to a forceful (0s) reboot: a pod
+	// can bind to the node after the fence taint is applied but before scheduler informers catch up, so we
+	// make at least one graceful eviction pass over this window rather than letting it ride the reboot.
+	// Mirrors the minimum-drain behavior from kubernetes-sigs/karpenter#2709.
+	minDrainTime = 5 * time.Second
 )
 
 // Controller drives the reboot lifecycle for NodeClaims carrying an active Rebooting condition.
@@ -213,22 +218,21 @@ func (c *Controller) reconcileIssued(ctx context.Context, nodeClaim *v1.NodeClai
 	return reconcile.Result{RequeueAfter: pollInterval}, nil
 }
 
-// drain runs a bounded graceful drain (eviction only, no cordon). Returns done=true when the drain
-// completes or the drainGracePeriod deadline elapses (residual pods ride the reboot). drainGracePeriod=0
-// skips the drain entirely (forceful).
+// drain runs a bounded graceful drain (eviction only, no cordon). Returns done=true when the drain completes
+// or the deadline elapses (residual pods ride the reboot). The window is max(drainGracePeriod, minDrainTime),
+// so even a forceful (0s) reboot makes a graceful eviction pass; a node with no pods to evict returns done
+// immediately, so the floor only delays reboots that actually have workloads to drain.
 func (c *Controller) drain(ctx context.Context, nodeClaim *v1.NodeClaim, node *corev1.Node, dgp time.Duration) (done bool, res reconcile.Result, err error) {
-	if dgp <= 0 {
-		return true, reconcile.Result{}, nil
-	}
 	// Deadline is measured from when the reboot was requested (the Rebooting condition's transition).
-	deadline := rebootRequestedAt(nodeClaim).Add(dgp)
+	deadline := rebootRequestedAt(nodeClaim).Add(max(dgp, minDrainTime))
 	if err := c.terminator.Drain(ctx, node, &deadline); err != nil {
 		if !terminator.IsNodeDrainError(err) {
 			return false, reconcile.Result{}, fmt.Errorf("draining node, %w", err)
 		}
-		// Pods still draining: keep trying until the deadline, then proceed with residual pods riding.
-		if c.clock.Now().Before(deadline) {
-			return false, reconcile.Result{RequeueAfter: deadline.Sub(c.clock.Now())}, nil
+		// Pods still draining: re-check every pollInterval (or sooner as the deadline nears) so we advance as
+		// soon as the node is empty, then proceed with residual pods riding once the deadline elapses.
+		if remaining := deadline.Sub(c.clock.Now()); remaining > 0 {
+			return false, reconcile.Result{RequeueAfter: min(pollInterval, remaining)}, nil
 		}
 	}
 	return true, reconcile.Result{}, nil
