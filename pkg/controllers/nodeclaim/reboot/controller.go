@@ -16,7 +16,7 @@ limitations under the License.
 
 // Package reboot implements the reboot node action: it drives a committed reboot (a NodeClaim carrying
 // a Rebooting=True/RebootRequested condition) through drain -> issue -> observe to a terminal
-// RebootSucceeded/RebootFailed outcome. The consumer (the disruption pipeline) commits the reboot; this
+// RebootSucceeded/RebootFailed outcome. A consumer (e.g. node repair) commits the reboot; this
 // controller carries it out and hands back a terminal outcome. See designs/reboot-node-action.md.
 package reboot
 

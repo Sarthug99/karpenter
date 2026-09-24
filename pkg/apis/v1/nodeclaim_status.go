@@ -37,7 +37,7 @@ const (
 )
 
 // Reboot lifecycle phases, carried as the reason on the Rebooting condition. RebootRequested is set
-// by the disruption pipeline at commitment; the reboot controller advances the rest.
+// by a consumer (e.g. node repair) at commitment; the reboot controller advances the rest.
 const (
 	RebootReasonRequested = "RebootRequested"
 	RebootReasonIssued    = "RebootIssued"
