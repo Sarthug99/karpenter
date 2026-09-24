@@ -90,8 +90,8 @@ var _ = Describe("Reboot Lifecycle", func() {
 		node.Labels[v1.NodePoolLabelKey] = nodePool.Name
 		node.Labels[v1.NodeInitializedLabelKey] = "true"
 		node.Status.NodeInfo.BootID = "boot-1"
-		// A committed reboot request always carries a valid drain-grace-period; 0s = forceful.
-		nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{v1.RebootDrainGracePeriodAnnotationKey: "0s"})
+		// A committed reboot request always carries a valid reboot termination grace period; 0s = forceful.
+		nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{v1.RebootTerminationGracePeriodAnnotationKey: "0s"})
 		nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeInitialized)
 		nodeClaim.StatusConditions().SetTrueWithReason(v1.ConditionTypeRebooting, v1.RebootReasonRequested, "reboot requested")
 	})
@@ -219,7 +219,7 @@ var _ = Describe("Reboot Lifecycle", func() {
 		})
 
 		It("waits to issue while pods still need draining", func() {
-			nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{v1.RebootDrainGracePeriodAnnotationKey: "10m"})
+			nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{v1.RebootTerminationGracePeriodAnnotationKey: "10m"})
 			pod := test.Pod(test.PodOptions{NodeName: node.Name})
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node, pod)
 			result := ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
@@ -298,22 +298,22 @@ var _ = Describe("Reboot Lifecycle", func() {
 			Expect(cond.Reason).To(Equal(v1.RebootReasonRequested)) // still retrying, not failed
 		})
 
-		It("fails with invalid_request when the drain-grace-period is missing", func() {
-			delete(nodeClaim.Annotations, v1.RebootDrainGracePeriodAnnotationKey)
+		It("fails with invalid_request when the reboot termination grace period is missing", func() {
+			delete(nodeClaim.Annotations, v1.RebootTerminationGracePeriodAnnotationKey)
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
 			expectInvalidRequest(nodeClaim)
 		})
 
-		It("fails with invalid_request when the drain-grace-period is malformed", func() {
-			nodeClaim.Annotations[v1.RebootDrainGracePeriodAnnotationKey] = "5min"
+		It("fails with invalid_request when the reboot termination grace period is malformed", func() {
+			nodeClaim.Annotations[v1.RebootTerminationGracePeriodAnnotationKey] = "5min"
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
 			expectInvalidRequest(nodeClaim)
 		})
 
-		It("fails with invalid_request when the drain-grace-period is negative", func() {
-			nodeClaim.Annotations[v1.RebootDrainGracePeriodAnnotationKey] = "-5m"
+		It("fails with invalid_request when the reboot termination grace period is negative", func() {
+			nodeClaim.Annotations[v1.RebootTerminationGracePeriodAnnotationKey] = "-5m"
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
 			expectInvalidRequest(nodeClaim)

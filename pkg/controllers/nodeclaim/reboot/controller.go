@@ -154,9 +154,9 @@ func (c *Controller) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (re
 
 // reconcileRequested applies the scheduling fence, drains (bounded), then issues the provider reboot.
 func (c *Controller) reconcileRequested(ctx context.Context, nodeClaim *v1.NodeClaim, node *corev1.Node) (reconcile.Result, error) {
-	// A committed reboot request must carry a valid drain bound; reject an invalid one terminally rather
-	// than defaulting to a (possibly destructive) forceful reboot.
-	dgp, err := drainGracePeriod(nodeClaim)
+	// A committed reboot request must carry a valid reboot termination grace period; reject an invalid one
+	// terminally rather than defaulting to a (possibly destructive) forceful reboot.
+	tgp, err := rebootTerminationGracePeriod(nodeClaim)
 	if err != nil {
 		return c.transitionToFailed(ctx, nodeClaim, node, resultInvalidRequest, fmt.Sprintf("invalid reboot request: %v", err))
 	}
@@ -175,7 +175,7 @@ func (c *Controller) reconcileRequested(ctx context.Context, nodeClaim *v1.NodeC
 
 	// Drain before issuing (only before we've recorded pre-boot state; on resume after that, skip drain).
 	if !issuing {
-		if done, res, err := c.drain(ctx, nodeClaim, node, dgp); err != nil || !done {
+		if done, res, err := c.drain(ctx, nodeClaim, node, tgp); err != nil || !done {
 			return res, err
 		}
 		// Record pre-boot state before the first provider call.
@@ -219,12 +219,12 @@ func (c *Controller) reconcileIssued(ctx context.Context, nodeClaim *v1.NodeClai
 }
 
 // drain runs a bounded graceful drain (eviction only, no cordon). Returns done=true when the drain completes
-// or the deadline elapses (residual pods ride the reboot). The window is max(drainGracePeriod, minDrainTime),
-// so even a forceful (0s) reboot makes a graceful eviction pass; a node with no pods to evict returns done
-// immediately, so the floor only delays reboots that actually have workloads to drain.
-func (c *Controller) drain(ctx context.Context, nodeClaim *v1.NodeClaim, node *corev1.Node, dgp time.Duration) (done bool, res reconcile.Result, err error) {
+// or the deadline elapses (residual pods ride the reboot). The window is max(reboot termination grace period,
+// minDrainTime), so even a forceful (0s) reboot makes a graceful eviction pass; a node with no pods to evict
+// returns done immediately, so the floor only delays reboots that actually have workloads to drain.
+func (c *Controller) drain(ctx context.Context, nodeClaim *v1.NodeClaim, node *corev1.Node, tgp time.Duration) (done bool, res reconcile.Result, err error) {
 	// Deadline is measured from when the reboot was requested (the Rebooting condition's transition).
-	deadline := rebootRequestedAt(nodeClaim).Add(max(dgp, minDrainTime))
+	deadline := rebootRequestedAt(nodeClaim).Add(max(tgp, minDrainTime))
 	if err := c.terminator.Drain(ctx, node, &deadline); err != nil {
 		if !terminator.IsNodeDrainError(err) {
 			return false, reconcile.Result{}, fmt.Errorf("draining node, %w", err)
@@ -381,21 +381,21 @@ func (c *Controller) removeInitializedLabel(ctx context.Context, node *corev1.No
 	return c.kubeClient.Patch(ctx, node, client.MergeFrom(stored))
 }
 
-// drainGracePeriod reads the consumer-stamped drain bound. A committed reboot request must carry a valid,
-// non-negative value: 0s = forceful (skip drain), >0 = graceful-bounded. Missing, malformed, or negative
-// is a producer contract violation (0s already means forceful), so it's an error the caller fails
-// terminally rather than silently selecting the most disruptive behavior.
-func drainGracePeriod(nodeClaim *v1.NodeClaim) (time.Duration, error) {
-	value, ok := nodeClaim.Annotations[v1.RebootDrainGracePeriodAnnotationKey]
+// rebootTerminationGracePeriod reads the consumer-stamped reboot termination grace period (the drain bound).
+// A committed reboot request must carry a valid, non-negative value: 0s = forceful, >0 = graceful-bounded.
+// Missing, malformed, or negative is a producer contract violation (0s already means forceful), so it's an
+// error the caller fails terminally rather than silently selecting the most disruptive behavior.
+func rebootTerminationGracePeriod(nodeClaim *v1.NodeClaim) (time.Duration, error) {
+	value, ok := nodeClaim.Annotations[v1.RebootTerminationGracePeriodAnnotationKey]
 	if !ok {
-		return 0, fmt.Errorf("drain-grace-period annotation is missing")
+		return 0, fmt.Errorf("reboot termination grace period annotation is missing")
 	}
 	d, err := time.ParseDuration(value)
 	if err != nil {
-		return 0, fmt.Errorf("parsing drain-grace-period %q: %w", value, err)
+		return 0, fmt.Errorf("parsing reboot termination grace period %q: %w", value, err)
 	}
 	if d < 0 {
-		return 0, fmt.Errorf("drain-grace-period must be non-negative, got %q", value)
+		return 0, fmt.Errorf("reboot termination grace period must be non-negative, got %q", value)
 	}
 	return d, nil
 }
