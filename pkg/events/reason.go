@@ -37,11 +37,8 @@ const (
 	NodeRepairBlocked = "NodeRepairBlocked"
 
 	// nodeclaim/reboot
-	RebootRequested = "RebootRequested"
-	RebootIssued    = "RebootIssued"
-	RebootObserved  = "RebootObserved"
-	RebootSucceeded = "RebootSucceeded"
-	RebootFailed    = "RebootFailed"
+	RebootObserved = "RebootObserved"
+	RebootFailed   = "RebootFailed"
 
 	// node/termination/terminator
 	Disrupted                      = "Disrupted"

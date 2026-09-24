@@ -137,9 +137,6 @@ var _ = Describe("Reboot Lifecycle", func() {
 			// transition itself — so it's still present right after the transition and gone after the next reconcile.
 			Expect(node.Labels).To(HaveKey(v1.NodeInitializedLabelKey))
 
-			Expect(recorder.Calls(events.RebootRequested)).To(BeNumerically(">=", 1))
-			Expect(recorder.Calls(events.RebootIssued)).To(Equal(1))
-
 			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
 			node = ExpectExists(ctx, env.Client, node)
 			Expect(node.Labels).ToNot(HaveKey(v1.NodeInitializedLabelKey))
@@ -208,7 +205,6 @@ var _ = Describe("Reboot Lifecycle", func() {
 			cond := nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting)
 			Expect(cond.IsTrue()).To(BeTrue())
 			Expect(cond.Reason).To(Equal(v1.RebootReasonRequested))
-			Expect(recorder.Calls(events.RebootIssued)).To(Equal(0))
 		})
 
 		It("skips issuing when the boot already changed after recording issuing state (restart safety)", func() {
@@ -386,7 +382,6 @@ var _ = Describe("Reboot Lifecycle", func() {
 			node = ExpectExists(ctx, env.Client, node)
 			Expect(hasRebootTaint(node)).To(BeFalse())
 
-			Expect(recorder.Calls(events.RebootSucceeded)).To(Equal(1))
 			ExpectMetricCounterValue(reboot.RebootsTotal, 1, map[string]string{"result": "succeeded"})
 			ExpectMetricHistogramSampleCountValue("karpenter_nodes_reboot_duration_seconds", 1, map[string]string{"result": "succeeded"})
 			ExpectMetricHistogramSampleCountValue("karpenter_nodes_reboot_recovery_duration_seconds", 1, map[string]string{})

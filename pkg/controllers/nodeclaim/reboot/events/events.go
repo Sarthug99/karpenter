@@ -53,20 +53,8 @@ func rebootEpisode(nodeClaim *v1.NodeClaim) string {
 	return ""
 }
 
-func RebootRequested(nodeClaim *v1.NodeClaim) events.Event {
-	return event(nodeClaim, corev1.EventTypeNormal, events.RebootRequested, "Reboot requested; fencing the node and draining before issuing")
-}
-
-func RebootIssued(nodeClaim *v1.NodeClaim) events.Event {
-	return event(nodeClaim, corev1.EventTypeNormal, events.RebootIssued, "Reboot issued to the cloud provider; awaiting a new boot")
-}
-
 func RebootObserved(nodeClaim *v1.NodeClaim) events.Event {
 	return event(nodeClaim, corev1.EventTypeNormal, events.RebootObserved, "New boot observed (bootID changed); awaiting node readiness")
-}
-
-func RebootSucceeded(nodeClaim *v1.NodeClaim) events.Event {
-	return event(nodeClaim, corev1.EventTypeNormal, events.RebootSucceeded, "Node rebooted and rejoined the cluster")
 }
 
 func RebootFailed(nodeClaim *v1.NodeClaim, message string) events.Event {
