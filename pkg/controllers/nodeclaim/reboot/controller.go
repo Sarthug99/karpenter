@@ -23,6 +23,7 @@ package reboot
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/awslabs/operatorpkg/reasonable"
@@ -30,6 +31,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/clock"
 	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -68,15 +70,23 @@ type Controller struct {
 	cloudProvider cloudprovider.CloudProvider
 	terminator    *terminator.Terminator
 	recorder      events.Recorder
+
+	// issuanceStartedMu guards issuanceStarted, the in-memory record of when each episode's post-drain
+	// provider-accept loop began (keyed by NodeClaim UID). It bounds only the issuance retry loop, so it is
+	// deliberately not persisted: a controller restart that loses it forgoes the issuance timeout for that
+	// episode (the reboot keeps retrying) rather than costing another annotation. See rebootDeadline.
+	issuanceStartedMu sync.Mutex
+	issuanceStarted   map[types.UID]time.Time
 }
 
 func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, t *terminator.Terminator, recorder events.Recorder) *Controller {
 	return &Controller{
-		clock:         clk,
-		kubeClient:    kubeClient,
-		cloudProvider: cloudProvider,
-		terminator:    t,
-		recorder:      recorder,
+		clock:           clk,
+		kubeClient:      kubeClient,
+		cloudProvider:   cloudProvider,
+		terminator:      t,
+		recorder:        recorder,
+		issuanceStarted: map[types.UID]time.Time{},
 	}
 }
 
@@ -227,17 +237,31 @@ func (c *Controller) drain(ctx context.Context, nodeClaim *v1.NodeClaim, node *c
 // recordIssuingState records the pre-reboot bootID before the first provider call, so a changed bootID
 // afterward proves the reboot happened (restart-safety) and terminal cleanup can scope to this episode.
 func (c *Controller) recordIssuingState(ctx context.Context, nodeClaim *v1.NodeClaim, node *corev1.Node) error {
-	stored := nodeClaim.DeepCopy()
-	// Record the pre-reboot bootID (restart-safety / episode scoping) and the drain-completion time, which
-	// anchors the post-drain issuance timeout independently of how much of the drain budget was used.
-	nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{
-		v1.RebootPreBootIDAnnotationKey:         node.Status.NodeInfo.BootID,
-		v1.RebootIssuanceStartedAtAnnotationKey: c.clock.Now().Format(time.RFC3339),
-	})
-	if equality.Semantic.DeepEqual(stored, nodeClaim) {
+	// Anchor the post-drain issuance timeout in memory (drain-completion time). It only bounds the
+	// provider-accept retry loop, so it isn't persisted; losing it on restart just forgoes that timeout.
+	c.setIssuanceStarted(nodeClaim.UID, c.clock.Now())
+	// The pre-reboot bootID must be durable: restart-safety and the operationID both derive from it, so a
+	// changed bootID after a restart still proves the reboot happened. Persist it before the provider call.
+	if nodeClaim.Annotations[v1.RebootPreBootIDAnnotationKey] == node.Status.NodeInfo.BootID {
 		return nil
 	}
+	stored := nodeClaim.DeepCopy()
+	nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{
+		v1.RebootPreBootIDAnnotationKey: node.Status.NodeInfo.BootID,
+	})
 	return c.kubeClient.Patch(ctx, nodeClaim, client.MergeFrom(stored))
+}
+
+func (c *Controller) setIssuanceStarted(uid types.UID, t time.Time) {
+	c.issuanceStartedMu.Lock()
+	defer c.issuanceStartedMu.Unlock()
+	c.issuanceStarted[uid] = t
+}
+
+func (c *Controller) clearIssuanceStarted(uid types.UID) {
+	c.issuanceStartedMu.Lock()
+	defer c.issuanceStartedMu.Unlock()
+	delete(c.issuanceStarted, uid)
 }
 
 func (c *Controller) transitionToIssued(ctx context.Context, nodeClaim *v1.NodeClaim, node *corev1.Node) (reconcile.Result, error) {
@@ -304,19 +328,18 @@ func (c *Controller) transitionToFailed(ctx context.Context, nodeClaim *v1.NodeC
 }
 
 func (c *Controller) setTerminal(ctx context.Context, nodeClaim *v1.NodeClaim, reason, msg string) error {
-	// Clear episode-scoped reboot state (metadata) first, so a later reboot on this NodeClaim starts clean
-	// and the restart-safety check can't misfire on a prior episode's pre-boot bootID.
-	stored := nodeClaim.DeepCopy()
-	_, hadPreBoot := nodeClaim.Annotations[v1.RebootPreBootIDAnnotationKey]
-	_, hadStarted := nodeClaim.Annotations[v1.RebootIssuanceStartedAtAnnotationKey]
-	if hadPreBoot || hadStarted {
+	// Clear episode-scoped reboot state first, so a later reboot on this NodeClaim starts clean and the
+	// restart-safety check can't misfire on a prior episode's pre-boot bootID. The issuance start is
+	// in-memory (see recordIssuingState); the pre-boot bootID is the only persisted episode annotation.
+	c.clearIssuanceStarted(nodeClaim.UID)
+	if _, hadPreBoot := nodeClaim.Annotations[v1.RebootPreBootIDAnnotationKey]; hadPreBoot {
+		stored := nodeClaim.DeepCopy()
 		delete(nodeClaim.Annotations, v1.RebootPreBootIDAnnotationKey)
-		delete(nodeClaim.Annotations, v1.RebootIssuanceStartedAtAnnotationKey)
 		if err := c.kubeClient.Patch(ctx, nodeClaim, client.MergeFrom(stored)); err != nil {
 			return err
 		}
 	}
-	stored = nodeClaim.DeepCopy()
+	stored := nodeClaim.DeepCopy()
 	nodeClaim.StatusConditions().SetFalse(v1.ConditionTypeRebooting, reason, msg)
 	if !equality.Semantic.DeepEqual(stored, nodeClaim) {
 		if err := c.kubeClient.Status().Patch(ctx, nodeClaim, client.MergeFrom(stored)); err != nil {
@@ -383,39 +406,42 @@ func (c *Controller) issuedAt(nodeClaim *v1.NodeClaim) (time.Time, bool) {
 	return cond.LastTransitionTime.Time, true
 }
 
-// issuanceStartedAt is when the drain completed and the provider-accept retry loop began.
+// issuanceStartedAt returns when this episode's post-drain provider-accept loop began, if the controller
+// recorded it in memory during this process lifetime. It's absent before the drain completes and after a
+// controller restart; in the latter case the issuance timeout simply does not apply (see rebootDeadline).
 func (c *Controller) issuanceStartedAt(nodeClaim *v1.NodeClaim) (time.Time, bool) {
-	t, err := time.Parse(time.RFC3339, nodeClaim.Annotations[v1.RebootIssuanceStartedAtAnnotationKey])
-	if err != nil {
-		return time.Time{}, false
-	}
-	return t, true
+	c.issuanceStartedMu.Lock()
+	defer c.issuanceStartedMu.Unlock()
+	t, ok := c.issuanceStarted[nodeClaim.UID]
+	return t, ok
 }
 
 // rebootDeadline is the wall-clock bound for the current phase, after which the reboot is failed. It is
-// derived only from the NodeClaim (never the Node), so it fires even when the Node has been deleted.
-func (c *Controller) rebootDeadline(nodeClaim *v1.NodeClaim) time.Time {
-	// An invalid drain-grace-period is failed terminally in reconcileRequested; here we only need a bound,
-	// so treat an unparseable/absent value as 0 for the fallback budget.
-	dgp, _ := drainGracePeriod(nodeClaim)
+// derived only from the NodeClaim (never the Node), so it fires even when the Node has been deleted. The
+// bool is false when the current phase has no bound, in which case the reboot keeps polling rather than
+// failing.
+func (c *Controller) rebootDeadline(nodeClaim *v1.NodeClaim) (time.Time, bool) {
 	if nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).Reason == v1.RebootReasonIssued {
+		// Observation window, anchored on the durable Initialized->Unknown transition (see issuedAt), so it
+		// bounds recovery even across controller restarts.
 		if issuedAt, ok := c.issuedAt(nodeClaim); ok {
-			return issuedAt.Add(observationWindow)
+			return issuedAt.Add(observationWindow), true
 		}
-		// Fallback if issuedAt isn't derivable: the full request budget plus the observation window.
-		return rebootRequestedAt(nodeClaim).Add(dgp + issuanceTimeout + observationWindow)
+		return time.Time{}, false
 	}
-	// RebootRequested: once issuing, bound the provider-accept loop from drain-completion. Before drain
-	// completes, fall back to the full request budget (drain + issuance) so a wedge during drain — e.g. a
-	// missing Node — still fails rather than polling forever.
+	// RebootRequested: bound the post-drain provider-accept loop from the in-memory issuance start. Before
+	// the drain completes, drain() bounds itself; if the issuance start is absent (never set, or lost to a
+	// controller restart before the provider call) we intentionally keep retrying rather than persisting the
+	// anchor. Being wedged here requires the controller to keep crashing pre-issuance, which is acceptable.
 	if startedAt, ok := c.issuanceStartedAt(nodeClaim); ok {
-		return startedAt.Add(issuanceTimeout)
+		return startedAt.Add(issuanceTimeout), true
 	}
-	return rebootRequestedAt(nodeClaim).Add(dgp + issuanceTimeout)
+	return time.Time{}, false
 }
 
 func (c *Controller) pastRebootDeadline(nodeClaim *v1.NodeClaim) bool {
-	return c.clock.Now().After(c.rebootDeadline(nodeClaim))
+	deadline, ok := c.rebootDeadline(nodeClaim)
+	return ok && c.clock.Now().After(deadline)
 }
 
 // deadlineResult maps the current phase to the terminal result label and message used when the deadline

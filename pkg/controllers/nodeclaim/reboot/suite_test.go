@@ -243,12 +243,14 @@ var _ = Describe("Reboot Lifecycle", func() {
 		})
 
 		It("fails with provider_error when issuance does not succeed within the issuance timeout", func() {
-			// Simulate a reboot stuck in the post-drain provider-accept loop.
-			nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{
-				v1.RebootPreBootIDAnnotationKey:         "boot-1",
-				v1.RebootIssuanceStartedAtAnnotationKey: env.Clock.Now().Format(time.RFC3339),
-			})
+			// The first reconcile records the (in-memory) issuance start and then hits a transient provider
+			// error, so the reboot stays in the post-drain provider-accept loop (RebootRequested). Once the
+			// clock passes the 5m issuance timeout, the next reconcile fails it at the deadline.
+			cloudProvider.NextRebootErr = fmt.Errorf("throttled")
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			_ = ExpectObjectReconcileFailed(ctx, env.Client, rebootController, nodeClaim)
+			Expect(cloudProvider.RebootCalls).To(BeEmpty())
+
 			env.Clock.Step(6 * time.Minute) // past the 5m issuance timeout
 			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
 
@@ -256,9 +258,27 @@ var _ = Describe("Reboot Lifecycle", func() {
 			cond := nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting)
 			Expect(cond.IsFalse()).To(BeTrue())
 			Expect(cond.Reason).To(Equal(v1.RebootReasonFailed))
-			Expect(cloudProvider.RebootCalls).To(BeEmpty()) // failed at the deadline, never re-issued
+			Expect(cloudProvider.RebootCalls).To(BeEmpty()) // failed at the deadline, never successfully issued
 			Expect(recorder.Calls(events.RebootFailed)).To(Equal(1))
 			ExpectMetricCounterValue(reboot.RebootsTotal, 1, map[string]string{"result": "provider_error"})
+		})
+
+		It("keeps retrying issuance (no deadline) after a restart drops the in-memory issuance start", func() {
+			// A committed reboot that has already persisted its pre-boot bootID (issuing) but whose in-memory
+			// issuance start was lost to a restart has no issuance deadline: it retries rather than failing.
+			nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{
+				v1.RebootPreBootIDAnnotationKey: "boot-1",
+			})
+			node.Status.NodeInfo.BootID = "boot-1" // unchanged boot: restart-safety doesn't short-circuit to Issued
+			cloudProvider.NextRebootErr = fmt.Errorf("throttled")
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			env.Clock.Step(30 * time.Minute) // well past any issuance timeout, but there is no anchor to bound
+			_ = ExpectObjectReconcileFailed(ctx, env.Client, rebootController, nodeClaim)
+
+			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+			cond := nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting)
+			Expect(cond.IsTrue()).To(BeTrue())
+			Expect(cond.Reason).To(Equal(v1.RebootReasonRequested)) // still retrying, not failed
 		})
 
 		It("fails with invalid_request when the drain-grace-period is missing", func() {
