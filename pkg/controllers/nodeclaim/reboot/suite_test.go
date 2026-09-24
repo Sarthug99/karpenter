@@ -133,10 +133,16 @@ var _ = Describe("Reboot Lifecycle", func() {
 
 			node = ExpectExists(ctx, env.Client, node)
 			Expect(hasRebootTaint(node)).To(BeTrue())
-			Expect(node.Labels).ToNot(HaveKey(v1.NodeInitializedLabelKey))
+			// The initialized label is cleared in the Issued phase (idempotently, every pass), not on the
+			// transition itself — so it's still present right after the transition and gone after the next reconcile.
+			Expect(node.Labels).To(HaveKey(v1.NodeInitializedLabelKey))
 
 			Expect(recorder.Calls(events.RebootRequested)).To(BeNumerically(">=", 1))
 			Expect(recorder.Calls(events.RebootIssued)).To(Equal(1))
+
+			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
+			node = ExpectExists(ctx, env.Client, node)
+			Expect(node.Labels).ToNot(HaveKey(v1.NodeInitializedLabelKey))
 		})
 
 		It("re-issues on a subsequent reboot of the same NodeClaim (no stale-state false success)", func() {
@@ -329,6 +335,18 @@ var _ = Describe("Reboot Lifecycle", func() {
 			// issuedAt is derived from the Initialized->Unknown transition, set at issue time.
 			nodeClaim.StatusConditions().SetUnknownWithReason(v1.ConditionTypeInitialized, v1.RebootReasonRequested, "node is rebooting")
 			node.Spec.Taints = append(node.Spec.Taints, v1.RebootingNoScheduleTaint)
+		})
+
+		It("clears the initialized label in the Issued phase (self-heals a crash after the transition)", func() {
+			// Simulate a crash after transitionToIssued flipped the status but before the label was cleared:
+			// the node is in the Issued phase with the initialized label still set. reconcileIssued removes it,
+			// so the label can't be orphaned by the transition's non-atomic writes.
+			node.Labels[v1.NodeInitializedLabelKey] = "true"
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
+
+			node = ExpectExists(ctx, env.Client, node)
+			Expect(node.Labels).ToNot(HaveKey(v1.NodeInitializedLabelKey))
 		})
 
 		It("stays issued while the node has not rebooted", func() {
