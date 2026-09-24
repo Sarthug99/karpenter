@@ -295,7 +295,13 @@ func BuildDisruptionBudgetMapping(ctx context.Context, cluster *state.Cluster, c
 		// candidate is MarkedForDeletion. Other reasons keep the reason-agnostic "unhealthy nodes consume budget"
 		// semantics introduced for consolidation/drift (kubernetes-sigs/karpenter#981).
 		notReady := nodeutils.GetCondition(node.Node, corev1.NodeReady).Status != corev1.ConditionTrue
-		if node.MarkedForDeletion() || (notReady && reason != v1.DisruptionReasonUnhealthy) {
+		// An in-flight reboot is a committed voluntary repair disruption that never marks the node for
+		// deletion, so it wouldn't otherwise consume budget. Count it against the repair (Unhealthy) budget
+		// only: other reasons already count a rebooting node via NotReady, and scoping here keeps their
+		// budgets unchanged. It's bounded (only nodes we committed to reboot, <= budget), so unlike
+		// merely-NotReady nodes it can't starve the repair budget.
+		if node.MarkedForDeletion() || (notReady && reason != v1.DisruptionReasonUnhealthy) ||
+			(node.RebootInProgress() && reason == v1.DisruptionReasonUnhealthy) {
 			disrupting[nodePool]++
 		}
 	}
