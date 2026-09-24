@@ -133,12 +133,6 @@ var _ = Describe("Reboot Lifecycle", func() {
 
 			node = ExpectExists(ctx, env.Client, node)
 			Expect(hasRebootTaint(node)).To(BeTrue())
-			// The initialized label is cleared in the Issued phase (idempotently, every pass), not on the
-			// transition itself — so it's still present right after the transition and gone after the next reconcile.
-			Expect(node.Labels).To(HaveKey(v1.NodeInitializedLabelKey))
-
-			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
-			node = ExpectExists(ctx, env.Client, node)
 			Expect(node.Labels).ToNot(HaveKey(v1.NodeInitializedLabelKey))
 		})
 

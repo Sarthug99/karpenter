@@ -169,7 +169,7 @@ func (c *Controller) reconcileRequested(ctx context.Context, nodeClaim *v1.NodeC
 	// reboot already happened — advance to observe without re-issuing.
 	preBootID, issuing := nodeClaim.Annotations[v1.RebootPreBootIDAnnotationKey]
 	if issuing && node.Status.NodeInfo.BootID != preBootID {
-		return c.transitionToIssued(ctx, nodeClaim)
+		return c.transitionToIssued(ctx, nodeClaim, node)
 	}
 
 	// Drain before issuing (only before we've recorded pre-boot state; on resume after that, skip drain).
@@ -191,15 +191,13 @@ func (c *Controller) reconcileRequested(ctx context.Context, nodeClaim *v1.NodeC
 		// Transient error: stay in RebootRequested and retry with backoff using the same operationID.
 		return reconcile.Result{}, fmt.Errorf("issuing reboot, %w", err)
 	}
-	return c.transitionToIssued(ctx, nodeClaim)
+	return c.transitionToIssued(ctx, nodeClaim, node)
 }
 
 // reconcileIssued observes recovery: remove the fence once the boot changes, succeed on a fresh boot +
 // Ready, fail if the observation window elapses first.
 func (c *Controller) reconcileIssued(ctx context.Context, nodeClaim *v1.NodeClaim, node *corev1.Node) (reconcile.Result, error) {
-	// The reboot invalidated the boot, so the node is no longer initialized. Clearing the label here rather
-	// than in transitionToIssued keeps that transition a single atomic status write: this runs on every
-	// Issued reconcile and is idempotent, so a crash right after the transition can't strand the label.
+	// Re-enforce the RebootIssued invariant (idempotent) so a crash after the transition can't strand the label.
 	if err := c.removeInitializedLabel(ctx, node); err != nil {
 		return reconcile.Result{}, err
 	}
@@ -273,18 +271,19 @@ func (c *Controller) clearIssuanceStarted(uid types.UID) {
 	delete(c.issuanceStarted, uid)
 }
 
-func (c *Controller) transitionToIssued(ctx context.Context, nodeClaim *v1.NodeClaim) (reconcile.Result, error) {
+func (c *Controller) transitionToIssued(ctx context.Context, nodeClaim *v1.NodeClaim, node *corev1.Node) (reconcile.Result, error) {
 	stored := nodeClaim.DeepCopy()
 	nodeClaim.StatusConditions().SetTrueWithReason(v1.ConditionTypeRebooting, v1.RebootReasonIssued, "reboot issued to the provider")
-	// Initialization is scoped to a boot; a committed reboot invalidates it until the node re-initializes.
-	// The Initialized->Unknown transition time also serves as the issuance timestamp (see issuedAt). The
-	// initialized label is cleared in reconcileIssued, not here, so this stays a single atomic status write
-	// with no second write to strand on a crash.
+	// Initialization is scoped to a boot; the Initialized->Unknown transition also stamps issuedAt.
 	nodeClaim.StatusConditions().SetUnknownWithReason(v1.ConditionTypeInitialized, v1.RebootReasonRequested, "node is rebooting")
 	if !equality.Semantic.DeepEqual(stored, nodeClaim) {
 		if err := c.kubeClient.Status().Patch(ctx, nodeClaim, client.MergeFrom(stored)); err != nil {
 			return reconcile.Result{}, err
 		}
+	}
+	// Best effort; reconcileIssued re-enforces this.
+	if err := c.removeInitializedLabel(ctx, node); err != nil {
+		return reconcile.Result{}, err
 	}
 	return reconcile.Result{RequeueAfter: pollInterval}, nil
 }
