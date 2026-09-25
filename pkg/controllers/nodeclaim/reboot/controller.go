@@ -58,8 +58,9 @@ const (
 	observationWindow = 20 * time.Minute
 	// pollInterval is how often we re-check for boot/readiness while observing recovery.
 	pollInterval = 15 * time.Second
-	// issuanceTimeout bounds the post-drain provider-accept retry loop before declaring RebootFailed.
-	// Mirrors nodeclaim lifecycle's LaunchTimeout: a provider control-plane call should complete within it.
+	// issuanceTimeout bounds the post-drain provider-accept retry loop before declaring RebootFailed. Mirrors
+	// nodeclaim lifecycle's LaunchTimeout. The issuance start is process-local (see Controller.issuanceStarted)
+	// and re-seeded on restart, so this bounds a window of continuous uptime, not a single durable deadline.
 	issuanceTimeout = 5 * time.Minute
 	// minDrainTime is the floor on the graceful drain window, applied even to a forceful (0s) reboot: a pod
 	// can bind to the node after the fence taint is applied but before scheduler informers catch up, so we
@@ -76,10 +77,10 @@ type Controller struct {
 	terminator    *terminator.Terminator
 	recorder      events.Recorder
 
-	// issuanceStartedMu guards issuanceStarted, the in-memory record of when each episode's post-drain
-	// provider-accept loop began (keyed by NodeClaim UID). It bounds only the issuance retry loop, so it is
-	// deliberately not persisted: a controller restart that loses it forgoes the issuance timeout for that
-	// episode (the reboot keeps retrying) rather than costing another annotation. See rebootDeadline.
+	// issuanceStartedMu guards issuanceStarted, the process-local record of when each episode's post-drain
+	// provider-accept loop began (keyed by NodeClaim UID). It bounds the issuance retry loop and is
+	// deliberately not persisted (avoids another annotation); a restart re-seeds it in reconcileRequested, so
+	// a restart restarts the issuance-timeout window rather than dropping the bound. See rebootDeadline.
 	issuanceStartedMu sync.Mutex
 	issuanceStarted   map[types.UID]time.Time
 }
@@ -168,8 +169,15 @@ func (c *Controller) reconcileRequested(ctx context.Context, nodeClaim *v1.NodeC
 	// Restart-safety: once we've begun issuing (pre-boot bootID recorded), a changed bootID proves the
 	// reboot already happened — advance to observe without re-issuing.
 	preBootID, issuing := nodeClaim.Annotations[v1.RebootPreBootIDAnnotationKey]
-	if issuing && node.Status.NodeInfo.BootID != preBootID {
-		return c.transitionToIssued(ctx, nodeClaim, node)
+	if issuing {
+		// A changed bootID proves the reboot already happened — advance to observe without re-issuing.
+		if node.Status.NodeInfo.BootID != preBootID {
+			return c.transitionToIssued(ctx, nodeClaim, node)
+		}
+		// Resuming the issuance loop (e.g. after a controller restart): the issuance-start timestamp is
+		// process-local, so re-seed it when missing. This restarts the issuance-timeout window rather than
+		// dropping the bound — evading the timeout requires the controller to restart within every window.
+		c.ensureIssuanceStarted(nodeClaim.UID)
 	}
 
 	// Drain before issuing (only before we've recorded pre-boot state; on resume after that, skip drain).
@@ -245,8 +253,8 @@ func (c *Controller) drain(ctx context.Context, nodeClaim *v1.NodeClaim, node *c
 // afterward proves the reboot happened (restart-safety) and terminal cleanup can scope to this episode.
 func (c *Controller) recordIssuingState(ctx context.Context, nodeClaim *v1.NodeClaim, node *corev1.Node) error {
 	// Anchor the post-drain issuance timeout in memory (drain-completion time). It only bounds the
-	// provider-accept retry loop, so it isn't persisted; losing it on restart just forgoes that timeout.
-	c.setIssuanceStarted(nodeClaim.UID, c.clock.Now())
+	// provider-accept retry loop, so it isn't persisted; a restart re-seeds it in reconcileRequested.
+	c.ensureIssuanceStarted(nodeClaim.UID)
 	// The pre-reboot bootID must be durable: restart-safety and the operationID both derive from it, so a
 	// changed bootID after a restart still proves the reboot happened. Persist it before the provider call.
 	if nodeClaim.Annotations[v1.RebootPreBootIDAnnotationKey] == node.Status.NodeInfo.BootID {
@@ -259,10 +267,14 @@ func (c *Controller) recordIssuingState(ctx context.Context, nodeClaim *v1.NodeC
 	return c.kubeClient.Patch(ctx, nodeClaim, client.MergeFrom(stored))
 }
 
-func (c *Controller) setIssuanceStarted(uid types.UID, t time.Time) {
+// ensureIssuanceStarted records the issuance-start time for this episode if not already set (set-if-absent),
+// so the first drain-completion or a post-restart resume seeds it and repeated calls are no-ops.
+func (c *Controller) ensureIssuanceStarted(uid types.UID) {
 	c.issuanceStartedMu.Lock()
 	defer c.issuanceStartedMu.Unlock()
-	c.issuanceStarted[uid] = t
+	if _, ok := c.issuanceStarted[uid]; !ok {
+		c.issuanceStarted[uid] = c.clock.Now()
+	}
 }
 
 func (c *Controller) clearIssuanceStarted(uid types.UID) {
@@ -433,10 +445,10 @@ func (c *Controller) rebootDeadline(nodeClaim *v1.NodeClaim) (time.Time, bool) {
 		}
 		return time.Time{}, false
 	}
-	// RebootRequested: bound the post-drain provider-accept loop from the in-memory issuance start. Before
-	// the drain completes, drain() bounds itself; if the issuance start is absent (never set, or lost to a
-	// controller restart before the provider call) we intentionally keep retrying rather than persisting the
-	// anchor. Being wedged here requires the controller to keep crashing pre-issuance, which is acceptable.
+	// RebootRequested: bound the post-drain provider-accept loop from the process-local issuance start. Before
+	// the drain completes (or on the first reconcile after a restart, before reconcileRequested re-seeds the
+	// start) there's no bound for that pass; drain() bounds itself, and the re-seed restarts the window on the
+	// next pass. Evading the timeout therefore requires the controller to restart within every window.
 	if startedAt, ok := c.issuanceStartedAt(nodeClaim); ok {
 		return startedAt.Add(issuanceTimeout), true
 	}

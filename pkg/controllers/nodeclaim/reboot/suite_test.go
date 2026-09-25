@@ -276,22 +276,30 @@ var _ = Describe("Reboot Lifecycle", func() {
 			ExpectMetricCounterValue(reboot.RebootsTotal, 1, map[string]string{"result": "provider_error"})
 		})
 
-		It("keeps retrying issuance (no deadline) after a restart drops the in-memory issuance start", func() {
-			// A committed reboot that has already persisted its pre-boot bootID (issuing) but whose in-memory
-			// issuance start was lost to a restart has no issuance deadline: it retries rather than failing.
+		It("re-seeds the issuance timer on restart and still enforces the timeout", func() {
+			// Simulate a restart mid-issuance: pre-boot bootID is persisted (issuing) but the process-local
+			// issuance start is gone. The reconcile re-seeds the start, so the timeout restarts as a fresh
+			// window rather than being lost — and it still fires once that window elapses.
 			nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{
 				v1.RebootPreBootIDAnnotationKey: "boot-1",
 			})
 			node.Status.NodeInfo.BootID = "boot-1" // unchanged boot: restart-safety doesn't short-circuit to Issued
 			cloudProvider.NextRebootErr = fmt.Errorf("throttled")
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
-			env.Clock.Step(30 * time.Minute) // well past any issuance timeout, but there is no anchor to bound
-			_ = ExpectObjectReconcileFailed(ctx, env.Client, rebootController, nodeClaim)
 
+			// First reconcile after the "restart" re-seeds the timer (no deadline yet) and stays RebootRequested.
+			_ = ExpectObjectReconcileFailed(ctx, env.Client, rebootController, nodeClaim)
+			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+			Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).Reason).To(Equal(v1.RebootReasonRequested))
+
+			// The re-seeded timer still fires: past the fresh 5m window, the reboot fails at the deadline.
+			env.Clock.Step(6 * time.Minute)
+			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
 			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
 			cond := nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting)
-			Expect(cond.IsTrue()).To(BeTrue())
-			Expect(cond.Reason).To(Equal(v1.RebootReasonRequested)) // still retrying, not failed
+			Expect(cond.IsFalse()).To(BeTrue())
+			Expect(cond.Reason).To(Equal(v1.RebootReasonFailed))
+			ExpectMetricCounterValue(reboot.RebootsTotal, 1, map[string]string{"result": "provider_error"})
 		})
 
 		It("fails with invalid_request when the reboot termination grace period is missing", func() {
