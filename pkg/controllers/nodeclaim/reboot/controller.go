@@ -285,9 +285,12 @@ func (c *Controller) clearIssuanceStarted(uid types.UID) {
 
 func (c *Controller) transitionToIssued(ctx context.Context, nodeClaim *v1.NodeClaim, node *corev1.Node) (reconcile.Result, error) {
 	stored := nodeClaim.DeepCopy()
-	nodeClaim.StatusConditions().SetTrueWithReason(v1.ConditionTypeRebooting, v1.RebootReasonIssued, "reboot issued to the provider")
-	// Initialization is scoped to a boot; the Initialized->Unknown transition also stamps issuedAt.
-	nodeClaim.StatusConditions().SetUnknownWithReason(v1.ConditionTypeInitialized, v1.RebootReasonRequested, "node is rebooting")
+	// Carry the driving-fault message forward across the phase change; the reason marks the phase (Issued).
+	cond := nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting)
+	nodeClaim.StatusConditions().SetTrueWithReason(v1.ConditionTypeRebooting, v1.RebootReasonIssued, cond.Message)
+	// Initialization is scoped to a boot; the Initialized->Unknown transition also stamps issuedAt. It's set
+	// at issue time, so the reason is Rebooting (the reboot is in flight), not RebootRequested.
+	nodeClaim.StatusConditions().SetUnknownWithReason(v1.ConditionTypeInitialized, v1.RebootReasonRebooting, "node is rebooting")
 	if !equality.Semantic.DeepEqual(stored, nodeClaim) {
 		if err := c.kubeClient.Status().Patch(ctx, nodeClaim, client.MergeFrom(stored)); err != nil {
 			return reconcile.Result{}, err

@@ -45,6 +45,11 @@ const (
 	RebootReasonFailed    = "RebootFailed"
 )
 
+// RebootReasonRebooting is set as the Initialized-condition reason when the reboot controller invalidates
+// initialization at issue time (Initialized becomes Unknown because the node is rebooting). It's applied
+// after the reboot is issued, so "Rebooting" is more accurate here than the RebootRequested phase reason.
+const RebootReasonRebooting = "Rebooting"
+
 // NodeClaimStatus defines the observed state of NodeClaim
 type NodeClaimStatus struct {
 	//nolint:kubeapilinter

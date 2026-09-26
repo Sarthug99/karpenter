@@ -124,12 +124,13 @@ var _ = Describe("Reboot Lifecycle", func() {
 			cond := nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting)
 			Expect(cond.IsTrue()).To(BeTrue())
 			Expect(cond.Reason).To(Equal(v1.RebootReasonIssued))
+			Expect(cond.Message).To(Equal("reboot requested")) // driving-fault message carried forward from RebootRequested
 			Expect(nodeClaim.Annotations).To(HaveKeyWithValue(v1.RebootPreBootIDAnnotationKey, "boot-1"))
 			Expect(cloudProvider.RebootOperationIDs[0]).ToNot(BeEmpty())
 			// A committed reboot invalidates Initialized (True -> Unknown) until the node re-initializes.
 			initialized := nodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized)
 			Expect(initialized.Status).To(Equal(metav1.ConditionUnknown))
-			Expect(initialized.Reason).To(Equal(v1.RebootReasonRequested))
+			Expect(initialized.Reason).To(Equal(v1.RebootReasonRebooting))
 
 			node = ExpectExists(ctx, env.Client, node)
 			Expect(hasRebootTaint(node)).To(BeTrue())
@@ -331,7 +332,7 @@ var _ = Describe("Reboot Lifecycle", func() {
 			})
 			nodeClaim.StatusConditions().SetTrueWithReason(v1.ConditionTypeRebooting, v1.RebootReasonIssued, "reboot issued")
 			// issuedAt is derived from the Initialized->Unknown transition, set at issue time.
-			nodeClaim.StatusConditions().SetUnknownWithReason(v1.ConditionTypeInitialized, v1.RebootReasonRequested, "node is rebooting")
+			nodeClaim.StatusConditions().SetUnknownWithReason(v1.ConditionTypeInitialized, v1.RebootReasonRebooting, "node is rebooting")
 			node.Spec.Taints = append(node.Spec.Taints, v1.RebootingNoScheduleTaint)
 		})
 
