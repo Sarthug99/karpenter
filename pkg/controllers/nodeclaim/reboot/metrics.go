@@ -61,6 +61,7 @@ var (
 			Help:      "Number of node reboots carried out by Karpenter, labeled by terminal result (succeeded, provider_error, recovery_timeout).",
 		},
 		[]opmetrics.Label{Result},
+		opmetrics.Beta,
 	)
 	// RebootDurationSeconds measures the whole reboot action: RebootRequested through the terminal
 	// outcome (includes fence + drain + issue + observe).
@@ -74,6 +75,7 @@ var (
 			Buckets:   rebootDurationBuckets,
 		},
 		[]opmetrics.Label{Result},
+		opmetrics.Beta,
 	)
 	// RebootRecoveryDurationSeconds measures pure reboot-to-recovery: issuance to a new boot rejoining
 	// (bootID changed + Ready). Drain-independent; recorded only on success. This is the signal used to
@@ -88,5 +90,6 @@ var (
 			Buckets:   rebootDurationBuckets,
 		},
 		[]opmetrics.Label{},
+		opmetrics.Beta,
 	)
 )
