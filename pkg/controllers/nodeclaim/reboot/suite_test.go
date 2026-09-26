@@ -26,7 +26,9 @@ import (
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/karpenter/pkg/apis"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -109,8 +111,22 @@ var _ = Describe("Reboot Lifecycle", func() {
 		cond := nc.StatusConditions().Get(v1.ConditionTypeRebooting)
 		Expect(cond.IsFalse()).To(BeTrue())
 		Expect(cond.Reason).To(Equal(v1.RebootReasonFailed))
-		Expect(cloudProvider.RebootCalls).To(BeEmpty()) // never issued — failed on the invalid request
+		Expect(nc.DeletionTimestamp.IsZero()).To(BeTrue()) // invalid_request is pre-drain: node is NOT replaced
+		Expect(cloudProvider.RebootCalls).To(BeEmpty())    // never issued — failed on the invalid request
 		ExpectMetricCounterValue(reboot.RebootsTotal, 1, map[string]string{"result": "invalid_request"})
+	}
+
+	// expectReplaced asserts a terminal RebootFailed on a drained node escalated to replacement: the reboot
+	// controller deleted the NodeClaim (gone, or deleting if a finalizer is present), and recorded the outcome.
+	expectReplaced := func(nc *v1.NodeClaim, result string) {
+		Expect(recorder.Calls(events.RebootFailed)).To(Equal(1))
+		ExpectMetricCounterValue(reboot.RebootsTotal, 1, map[string]string{"result": result})
+		updated := &v1.NodeClaim{}
+		if err := env.Client.Get(ctx, client.ObjectKeyFromObject(nc), updated); err == nil {
+			Expect(updated.DeletionTimestamp.IsZero()).To(BeFalse())
+		} else {
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
+		}
 	}
 
 	Context("RebootRequested", func() {
@@ -178,16 +194,9 @@ var _ = Describe("Reboot Lifecycle", func() {
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
 
-			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
-			cond := nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting)
-			Expect(cond.IsFalse()).To(BeTrue())
-			Expect(cond.Reason).To(Equal(v1.RebootReasonFailed))
-
 			node = ExpectExists(ctx, env.Client, node)
 			Expect(hasRebootTaint(node)).To(BeFalse())
-
-			Expect(recorder.Calls(events.RebootFailed)).To(Equal(1))
-			ExpectMetricCounterValue(reboot.RebootsTotal, 1, map[string]string{"result": "provider_error"})
+			expectReplaced(nodeClaim, "provider_error")
 		})
 
 		It("retries on a transient provider error, staying in RebootRequested", func() {
@@ -268,13 +277,8 @@ var _ = Describe("Reboot Lifecycle", func() {
 			env.Clock.Step(6 * time.Minute) // past the 5m issuance timeout
 			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
 
-			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
-			cond := nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting)
-			Expect(cond.IsFalse()).To(BeTrue())
-			Expect(cond.Reason).To(Equal(v1.RebootReasonFailed))
 			Expect(cloudProvider.RebootCalls).To(BeEmpty()) // failed at the deadline, never successfully issued
-			Expect(recorder.Calls(events.RebootFailed)).To(Equal(1))
-			ExpectMetricCounterValue(reboot.RebootsTotal, 1, map[string]string{"result": "provider_error"})
+			expectReplaced(nodeClaim, "provider_error")
 		})
 
 		It("re-seeds the issuance timer on restart and still enforces the timeout", func() {
@@ -293,14 +297,10 @@ var _ = Describe("Reboot Lifecycle", func() {
 			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
 			Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).Reason).To(Equal(v1.RebootReasonRequested))
 
-			// The re-seeded timer still fires: past the fresh 5m window, the reboot fails at the deadline.
+			// The re-seeded timer still fires: past the fresh 5m window, the reboot fails and replaces the node.
 			env.Clock.Step(6 * time.Minute)
 			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
-			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
-			cond := nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting)
-			Expect(cond.IsFalse()).To(BeTrue())
-			Expect(cond.Reason).To(Equal(v1.RebootReasonFailed))
-			ExpectMetricCounterValue(reboot.RebootsTotal, 1, map[string]string{"result": "provider_error"})
+			expectReplaced(nodeClaim, "provider_error")
 		})
 
 		It("fails with invalid_request when the reboot termination grace period is missing", func() {
@@ -395,15 +395,9 @@ var _ = Describe("Reboot Lifecycle", func() {
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
 
-			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
-			cond := nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting)
-			Expect(cond.IsFalse()).To(BeTrue())
-			Expect(cond.Reason).To(Equal(v1.RebootReasonFailed))
 			node = ExpectExists(ctx, env.Client, node)
 			Expect(hasRebootTaint(node)).To(BeFalse())
-
-			Expect(recorder.Calls(events.RebootFailed)).To(Equal(1))
-			ExpectMetricCounterValue(reboot.RebootsTotal, 1, map[string]string{"result": "recovery_timeout"})
+			expectReplaced(nodeClaim, "recovery_timeout")
 		})
 
 		It("fails when the node is gone and the deadline has elapsed", func() {
@@ -411,11 +405,7 @@ var _ = Describe("Reboot Lifecycle", func() {
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim) // node intentionally not applied
 			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
 
-			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
-			cond := nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting)
-			Expect(cond.IsFalse()).To(BeTrue())
-			Expect(cond.Reason).To(Equal(v1.RebootReasonFailed))
-			ExpectMetricCounterValue(reboot.RebootsTotal, 1, map[string]string{"result": "recovery_timeout"})
+			expectReplaced(nodeClaim, "recovery_timeout")
 		})
 
 		It("keeps polling when the node is gone but the deadline has not elapsed", func() {

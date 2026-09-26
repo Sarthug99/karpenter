@@ -343,6 +343,16 @@ func (c *Controller) transitionToFailed(ctx context.Context, nodeClaim *v1.NodeC
 	// Record events/metrics only after the terminal patch is durable (see transitionToSucceeded).
 	c.recorder.Publish(rebootevents.RebootFailed(nodeClaim, msg))
 	recordTerminalMetrics(result, duration)
+	// Escalate to replacement: a reboot that reached the drain step already disrupted the node (its
+	// workloads were drained/fenced and it is NotReady/uninitialized), so it can't be cleanly returned to
+	// service. Delete the NodeClaim — the termination finalizer drains + terminates and provisioning
+	// replaces it. The sole exception is a pre-drain invalid_request (the node is untouched; it's a
+	// producer-contract violation), which we surface without destroying the node.
+	if result != resultInvalidRequest {
+		if err := c.kubeClient.Delete(ctx, nodeClaim); err != nil {
+			return reconcile.Result{}, client.IgnoreNotFound(err)
+		}
+	}
 	return reconcile.Result{}, nil
 }
 
