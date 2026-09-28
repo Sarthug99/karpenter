@@ -287,6 +287,57 @@ var _ = Describe("Repair", func() {
 		Expect(nodeClaim.Annotations).ToNot(HaveKey(v1.RebootTerminationGracePeriodAnnotationKey))
 	})
 
+	Context("reboot history", func() {
+		BeforeEach(func() {
+			cloudProvider.RepairPolicy = []cloudprovider.RepairPolicy{
+				{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, ReasonRegex: "RebootMe", TolerationDuration: 10 * time.Minute, Action: cloudprovider.RebootNode},
+				// Required default fallback; its toleration outlasts these specs so only history escalates to replace.
+				{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, TolerationDuration: 48 * time.Hour, Action: cloudprovider.ReplaceNode},
+			}
+			newRepairController()
+			initNode(nodeClaim, node)
+			markUnhealthyWithReason(node, "BadNode", "RebootMe")
+			env.Clock.Step(11 * time.Minute)
+		})
+
+		// rebootAndSucceed commits a reboot through repair, then completes it successfully while the fault persists,
+		// so the node is eligible for repair again.
+		rebootAndSucceed := func() {
+			GinkgoHelper()
+			// Commits on the first pass, even right after a previous reboot finished: the commit re-reads the
+			// NodeClaim, so the sweep clearing the finished reboot's DisruptionReason in the same pass can't conflict.
+			result := ExpectSingletonReconciled(ctx, repairController)
+			Expect(result.RequeueAfter).To(Equal(singleton.RequeueImmediately))
+			Expect(queue.GetCommands()).To(BeEmpty())
+			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+			Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).Reason).To(Equal(v1.RebootReasonRequested))
+			nodeClaim.StatusConditions().SetFalse(v1.ConditionTypeRebooting, v1.RebootReasonSucceeded, "node rebooted and rejoined the cluster")
+			ExpectApplied(ctx, env.Client, nodeClaim)
+			ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(nodeClaim))
+			env.Clock.Step(time.Minute)
+		}
+
+		It("should escalate to replacement when the fault recurs after two successful reboots", func() {
+			rebootAndSucceed()
+			rebootAndSucceed()
+
+			// A third occurrence within the window replaces the node instead of rebooting it again.
+			ExpectSingletonReconciled(ctx, repairController)
+			Expect(queue.GetCommands()).To(HaveLen(1))
+			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+			Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).Reason).To(Equal(v1.RebootReasonSucceeded))
+		})
+
+		It("should reboot again once earlier reboots age out of the window", func() {
+			rebootAndSucceed()
+			rebootAndSucceed()
+
+			// The history window runs on the repair clock, so reboots older than 24h no longer count.
+			env.Clock.Step(25 * time.Hour)
+			rebootAndSucceed()
+		})
+	})
+
 	// INV-S9: repair never fires before the policy toleration elapses.
 	It("should not repair before the toleration duration elapses", func() {
 		initNode(nodeClaim, node)

@@ -79,7 +79,7 @@ func NewRepair(c consolidation) *Repair {
 	return &Repair{
 		consolidation:      c,
 		policyMatcher:      policyMatcher,
-		rebootHistory:      NewRebootHistory(),
+		rebootHistory:      newRebootHistory(c.clock),
 		decisionLogMonitor: pretty.NewChangeMonitor(),
 	}
 }
@@ -157,7 +157,8 @@ func (r *Repair) commandForCandidate(
 	// a performed action; RebootInProgress() then excludes the node from further disruption and counts it
 	// against every budget until it reaches a terminal outcome.
 	if candidate.Action == cloudprovider.RebootNode {
-		if err := r.commitReboot(ctx, candidate); err != nil {
+		committed, err := r.commitReboot(ctx, candidate)
+		if err != nil || !committed {
 			return Command{}, false, err
 		}
 		return Command{
@@ -189,8 +190,17 @@ func (r *Repair) commandForCandidate(
 // (reason RebootRequested, carrying the driving fault) and the reboot termination grace period on the
 // NodeClaim, then records the committed attempt for escalation. The reboot itself is driven by the
 // nodeclaim.reboot controller; repair does not terminate or replace the node here.
-func (r *Repair) commitReboot(ctx context.Context, candidate *Candidate) error {
-	nodeClaim := candidate.NodeClaim
+func (r *Repair) commitReboot(ctx context.Context, candidate *Candidate) (bool, error) {
+	// Re-read the NodeClaim rather than patching the cluster-state copy, which may lag the API server (e.g. the
+	// stale-disruption sweep may have just cleared a finished reboot's DisruptionReason). If the fresh copy shows a
+	// reboot already in flight, the candidate was stale: don't commit it again.
+	nodeClaim := &v1.NodeClaim{}
+	if err := r.kubeClient.Get(ctx, client.ObjectKeyFromObject(candidate.NodeClaim), nodeClaim); err != nil {
+		return false, client.IgnoreNotFound(err)
+	}
+	if nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).IsTrue() || !nodeClaim.DeletionTimestamp.IsZero() {
+		return false, nil
+	}
 	// Resolve the reboot termination grace period: the policy-resolved bound if set, else inherit the
 	// NodeClaim's (NodePool) TerminationGracePeriod. If neither is set, leave the annotation unset so the
 	// executor drains unbounded (mirrors termination's nil-TGP semantics); nil must not mean forceful.
@@ -206,7 +216,7 @@ func (r *Repair) commitReboot(ctx context.Context, candidate *Candidate) error {
 			v1.RebootTerminationGracePeriodAnnotationKey: tgp.String(),
 		})
 		if err := r.kubeClient.Patch(ctx, nodeClaim, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); err != nil {
-			return err
+			return false, err
 		}
 	}
 	// Stamp DisruptionReason alongside Rebooting so evictions during the reboot drain are attributed to repair,
@@ -216,19 +226,20 @@ func (r *Repair) commitReboot(ctx context.Context, candidate *Candidate) error {
 		string(r.Reason()), string(r.Reason()))
 	nodeClaim.StatusConditions(status.WithClock(r.clock)).SetTrueWithReason(v1.ConditionTypeRebooting, v1.RebootReasonRequested,
 		fmt.Sprintf("rebooting for %s/%s", candidate.RepairCondition.Type, candidate.RepairCondition.Reason))
-	// Optimistic locking: the candidate comes from cluster state, which may lag the API server. A stale base must
-	// conflict (and requeue) rather than overwrite a newer reboot phase with RebootRequested.
+	// Optimistic locking: a write that lands between the read above and this patch must conflict (and requeue)
+	// rather than be overwritten.
 	if err := r.kubeClient.Status().Patch(ctx, nodeClaim, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); err != nil {
-		return err
+		return false, err
 	}
+	candidate.NodeClaim = nodeClaim
 	// Write the committed NodeClaim into cluster state now, so the immediate requeue sees the node as rebooting
 	// (excluded from candidates, counted against budgets) instead of waiting on the informer.
 	r.cluster.UpdateNodeClaim(nodeClaim)
-	// The candidate is not RebootInProgress (ValidateNodeDisruptable excludes such nodes), so this is a fresh
-	// commit; record it once for the reboot->replace escalation window.
+	// The fresh copy was not rebooting, so this is a new commit; record it once for the reboot->replace
+	// escalation window.
 	r.rebootHistory.RecordCommittedReboot(nodeClaim.UID)
 	log.FromContext(ctx).WithValues("NodeClaim", klog.KObj(nodeClaim)).Info("committed node reboot")
-	return nil
+	return true, nil
 }
 
 func (r *Repair) sortCandidates(candidates []*Candidate) {
