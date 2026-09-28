@@ -119,6 +119,11 @@ func (c *Controller) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (re
 	if cond == nil || !cond.IsTrue() {
 		return reconcile.Result{}, nil
 	}
+	// A reboot that failed into replacement leaves Rebooting=True on a deleting NodeClaim (see
+	// transitionToFailed); termination owns it from here.
+	if !nodeClaim.DeletionTimestamp.IsZero() {
+		return reconcile.Result{}, nil
+	}
 
 	node, err := nodeclaimutils.NodeForNodeClaim(ctx, c.kubeClient, nodeClaim)
 	if err != nil {
@@ -230,13 +235,15 @@ func (c *Controller) reconcileIssued(ctx context.Context, nodeClaim *v1.NodeClai
 }
 
 // drain runs a graceful drain (eviction only, no cordon). Returns done=true when the drain completes or the
-// deadline elapses (residual pods ride the reboot). With a reboot termination grace period, the window is
-// max(tgp, minDrainTime), so even a forceful (0s) reboot makes a graceful eviction pass; a node with no pods to
-// evict returns done immediately, so the floor only delays reboots that actually have workloads to drain.
-// Without one (nil), the drain is unbounded, mirroring termination's nil-TGP behavior: it waits until every
-// pod has evicted.
+// deadline elapses (residual pods ride the reboot). Every reboot holds for at least minDrainTime after it was
+// requested, even a forceful (0s) one and even when the node is already empty: a pod the scheduler bound
+// before its informers observed the fence taint may still land, and the floor gives it a graceful eviction
+// pass instead of letting it ride the reboot. With a reboot termination grace period, the drain deadline is
+// max(tgp, minDrainTime); without one (nil), the drain is unbounded, mirroring termination's nil-TGP behavior:
+// it waits until every pod has evicted.
 func (c *Controller) drain(ctx context.Context, nodeClaim *v1.NodeClaim, node *corev1.Node, tgp *time.Duration) (done bool, res reconcile.Result, err error) {
-	// Deadline is measured from when the reboot was requested (the Rebooting condition's transition).
+	// Deadlines are measured from when the reboot was requested (the Rebooting condition's transition).
+	floor := rebootRequestedAt(nodeClaim).Add(minDrainTime)
 	var deadline *time.Time
 	if tgp != nil {
 		deadline = lo.ToPtr(rebootRequestedAt(nodeClaim).Add(max(*tgp, minDrainTime)))
@@ -253,6 +260,11 @@ func (c *Controller) drain(ctx context.Context, nodeClaim *v1.NodeClaim, node *c
 		if remaining := deadline.Sub(c.clock.Now()); remaining > 0 {
 			return false, reconcile.Result{RequeueAfter: min(pollInterval, remaining)}, nil
 		}
+		return true, reconcile.Result{}, nil // deadline elapsed (always at or past the floor)
+	}
+	// Drained, but hold until the floor so a late-binding pod is still caught by a later drain pass.
+	if remaining := floor.Sub(c.clock.Now()); remaining > 0 {
+		return false, reconcile.Result{RequeueAfter: remaining}, nil
 	}
 	return true, reconcile.Result{}, nil
 }
@@ -343,24 +355,30 @@ func (c *Controller) transitionToFailed(ctx context.Context, nodeClaim *v1.NodeC
 			return reconcile.Result{}, err
 		}
 	}
-	// Capture duration before setTerminal resets the Rebooting condition's transition time.
 	duration := c.clock.Since(rebootRequestedAt(nodeClaim))
-	if err := c.setTerminal(ctx, nodeClaim, v1.RebootReasonFailed, msg); err != nil {
-		return reconcile.Result{}, err
-	}
-	// Record events/metrics only after the terminal patch is durable (see transitionToSucceeded).
-	c.recorder.Publish(rebootevents.RebootFailed(nodeClaim, msg))
-	recordTerminalMetrics(result, duration)
-	// Escalate to replacement: a reboot that reached the drain step already disrupted the node (its
-	// workloads were drained/fenced and it is NotReady/uninitialized), so it can't be cleanly returned to
-	// service. Delete the NodeClaim — the termination finalizer drains + terminates and provisioning
-	// replaces it. The sole exception is a pre-drain invalid_request (the node is untouched; it's a
-	// producer-contract violation), which we surface without destroying the node.
-	if result != resultInvalidRequest {
-		if err := c.kubeClient.Delete(ctx, nodeClaim); err != nil {
+	if result == resultInvalidRequest {
+		// A pre-drain invalid request left the node untouched, so it isn't replaced (it's a producer-contract
+		// violation). Record the terminal RebootFailed so the lifecycle ends.
+		if err := c.setTerminal(ctx, nodeClaim, v1.RebootReasonFailed, msg); err != nil {
+			return reconcile.Result{}, err
+		}
+	} else {
+		// Escalate to replacement: a reboot that reached the drain step already disrupted the node (its
+		// workloads were drained/fenced and it may be NotReady/uninitialized), so it can't be cleanly returned
+		// to service. Delete the NodeClaim — the termination finalizer drains + terminates and provisioning
+		// replaces it. Like a launch ICE, we don't record a terminal condition on a NodeClaim that is going
+		// away: Rebooting stays True, so a failed delete re-enters this path on the next reconcile and retries.
+		// The resourceVersion precondition makes a repeat reconcile on a stale cache (the delete already
+		// happened) conflict instead of re-emitting the event and metrics.
+		if err := c.kubeClient.Delete(ctx, nodeClaim, client.Preconditions{ResourceVersion: lo.ToPtr(nodeClaim.ResourceVersion)}); err != nil {
 			return reconcile.Result{}, client.IgnoreNotFound(err)
 		}
+		c.clearIssuanceStarted(nodeClaim.UID)
+		log.FromContext(ctx).WithValues("result", result).Info("reboot failed, replacing node")
 	}
+	// Record events/metrics only after the terminal write is durable, so a failed write can't double-count.
+	c.recorder.Publish(rebootevents.RebootFailed(nodeClaim, msg))
+	recordTerminalMetrics(result, duration)
 	return reconcile.Result{}, nil
 }
 
