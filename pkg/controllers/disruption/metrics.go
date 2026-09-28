@@ -71,6 +71,10 @@ var (
 				Name: string(DeleteDecision),
 				Help: "The candidate(s) were deleted without replacement.",
 			},
+			{
+				Name: string(RebootDecision),
+				Help: "The candidate(s) were rebooted in place.",
+			},
 		},
 	}
 	// ApprovalDim is the `decision` dimension for the balanced-consolidation move

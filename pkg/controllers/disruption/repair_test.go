@@ -19,8 +19,10 @@ package disruption_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
+	"github.com/awslabs/operatorpkg/singleton"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
@@ -226,6 +228,63 @@ var _ = Describe("Repair", func() {
 		Expect(cmds).To(HaveLen(1))
 		Expect(cmds[0].Decision()).To(Equal(disruption.DeleteDecision))
 		Expect(cmds[0].Replacements).To(BeEmpty())
+	})
+
+	It("should commit an in-place reboot (no replacement, no termination) for a RebootNode policy", func() {
+		cloudProvider.RepairPolicy = []cloudprovider.RepairPolicy{
+			{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, ReasonRegex: "RebootMe", TolerationDuration: 10 * time.Minute, Action: cloudprovider.RebootNode, TerminationGracePeriod: lo.ToPtr(5 * time.Minute)},
+			{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, TolerationDuration: 30 * time.Minute, Action: cloudprovider.ReplaceNode},
+		}
+		newRepairController()
+		initNode(nodeClaim, node)
+		markUnhealthyWithReason(node, "BadNode", "RebootMe")
+		env.Clock.Step(11 * time.Minute) // past the reboot toleration, before the replace fallback
+
+		// The committed reboot is a performed action, so the pass stops and requeues immediately.
+		result := ExpectSingletonReconciled(ctx, repairController)
+		Expect(result.RequeueAfter).To(Equal(singleton.RequeueImmediately))
+
+		// Reboot is in-place: no replace-then-terminate command is queued.
+		Expect(queue.GetCommands()).To(BeEmpty())
+
+		// The NodeClaim is handed off to the reboot controller (Rebooting=RebootRequested + drain bound) and not terminated.
+		nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+		cond := nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting)
+		Expect(cond.IsTrue()).To(BeTrue())
+		Expect(cond.Reason).To(Equal(v1.RebootReasonRequested))
+		Expect(nodeClaim.Annotations).To(HaveKeyWithValue(v1.RebootTerminationGracePeriodAnnotationKey, "5m0s"))
+		Expect(nodeClaim.DeletionTimestamp.IsZero()).To(BeTrue())
+		Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeDisruptionReason).Reason).To(Equal(string(v1.DisruptionReasonUnhealthy)))
+		ExpectMetricCounterValue(disruption.DecisionsPerformedTotal, 1, map[string]string{
+			"decision":          string(disruption.RebootDecision),
+			metrics.ReasonLabel: strings.ToLower(string(v1.DisruptionReasonUnhealthy)),
+		})
+
+		// The immediate next pass, before the informer observes the commit, must see the node as rebooting: it must not
+		// re-commit it or sweep the in-flight reboot's DisruptionReason as outdated.
+		result = ExpectSingletonReconciled(ctx, repairController)
+		Expect(result.RequeueAfter).ToNot(Equal(singleton.RequeueImmediately))
+		nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+		Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeDisruptionReason).IsTrue()).To(BeTrue())
+		Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).Reason).To(Equal(v1.RebootReasonRequested))
+	})
+
+	It("should leave the reboot TGP annotation unset (unbounded) when neither policy nor NodeClaim sets one", func() {
+		cloudProvider.RepairPolicy = []cloudprovider.RepairPolicy{
+			{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, ReasonRegex: "RebootMe", TolerationDuration: 10 * time.Minute, Action: cloudprovider.RebootNode},
+			{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, TolerationDuration: 30 * time.Minute, Action: cloudprovider.ReplaceNode},
+		}
+		newRepairController()
+		initNode(nodeClaim, node)
+		markUnhealthyWithReason(node, "BadNode", "RebootMe")
+		env.Clock.Step(11 * time.Minute)
+
+		ExpectSingletonReconciled(ctx, repairController)
+
+		nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+		Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).Reason).To(Equal(v1.RebootReasonRequested))
+		// nil policy TGP + nil NodeClaim TGP -> unbounded graceful drain: the annotation is left unset (not "0s").
+		Expect(nodeClaim.Annotations).ToNot(HaveKey(v1.RebootTerminationGracePeriodAnnotationKey))
 	})
 
 	// INV-S9: repair never fires before the policy toleration elapses.

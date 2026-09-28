@@ -24,6 +24,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/awslabs/operatorpkg/status"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
@@ -60,6 +61,7 @@ const (
 type Repair struct {
 	consolidation
 	policyMatcher      *health.RepairPolicyMatcher
+	rebootHistory      *RebootHistory
 	decisionLogMonitor *pretty.ChangeMonitor
 }
 
@@ -70,13 +72,14 @@ func NewRepair(c consolidation) *Repair {
 	if len(policies) == 0 {
 		panic("node repair requires the cloud provider to define RepairPolicies, but it defines none")
 	}
-	policyMatcher, err := health.NewRepairPolicyMatcher(policies, sets.New(cloudprovider.ReplaceNode))
+	policyMatcher, err := health.NewRepairPolicyMatcher(policies, sets.New(cloudprovider.ReplaceNode, cloudprovider.RebootNode))
 	if err != nil {
 		panic(fmt.Sprintf("node repair requires valid RepairPolicies: %v", err))
 	}
 	return &Repair{
 		consolidation:      c,
 		policyMatcher:      policyMatcher,
+		rebootHistory:      NewRebootHistory(),
 		decisionLogMonitor: pretty.NewChangeMonitor(),
 	}
 }
@@ -101,7 +104,9 @@ func (r *Repair) ShouldDisrupt(ctx context.Context, c *Candidate) bool {
 	evaluation := r.policyMatcher.Evaluate(c.Node, now)
 	r.logRepairPolicyDecisions(ctx, c.Node, evaluation.Evaluations)
 	c.repairScore = evaluation.Score
-	if !resolveRepairCandidate(c, repairResults(evaluation.Evaluations)) {
+	// Resolve the action with reboot-history escalation (repeated reboots within the window -> replace). A node
+	// whose reboot is in flight never reaches here (ValidateNodeDisruptable rejects RebootInProgress nodes).
+	if !r.rebootHistory.Resolve(c, repairResults(evaluation.Evaluations)) {
 		return false
 	}
 	c.TerminationGracePeriod = effectiveDrainBound(c, c.TerminationGracePeriod)
@@ -147,6 +152,20 @@ func (r *Repair) commandForCandidate(
 	if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
 		return Command{}, false, nil
 	}
+	// A reboot is in-place: no replacement, no termination. Hand it off to the reboot controller (stamp the
+	// Rebooting condition + drain bound on the NodeClaim) and return a reboot command so the pass registers as
+	// a performed action; RebootInProgress() then excludes the node from further disruption and counts it
+	// against every budget until it reaches a terminal outcome.
+	if candidate.Action == cloudprovider.RebootNode {
+		if err := r.commitReboot(ctx, candidate); err != nil {
+			return Command{}, false, err
+		}
+		return Command{
+			Candidates:          []*Candidate{candidate},
+			PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{candidate}),
+			Reboot:              true,
+		}, true, nil
+	}
 	candidate, results, ok, err := r.replacementForCandidate(ctx, candidate)
 	if err != nil {
 		return Command{}, false, err
@@ -164,6 +183,52 @@ func (r *Repair) commandForCandidate(
 		Results:             results,
 		PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{candidate}),
 	}, true, nil
+}
+
+// commitReboot hands a resolved reboot off to the reboot controller by stamping the Rebooting condition
+// (reason RebootRequested, carrying the driving fault) and the reboot termination grace period on the
+// NodeClaim, then records the committed attempt for escalation. The reboot itself is driven by the
+// nodeclaim.reboot controller; repair does not terminate or replace the node here.
+func (r *Repair) commitReboot(ctx context.Context, candidate *Candidate) error {
+	nodeClaim := candidate.NodeClaim
+	// Resolve the reboot termination grace period: the policy-resolved bound if set, else inherit the
+	// NodeClaim's (NodePool) TerminationGracePeriod. If neither is set, leave the annotation unset so the
+	// executor drains unbounded (mirrors termination's nil-TGP semantics); nil must not mean forceful.
+	var tgp *time.Duration
+	if candidate.TerminationGracePeriod != nil {
+		tgp = candidate.TerminationGracePeriod
+	} else if ncTGP := nodeClaim.Spec.TerminationGracePeriod; ncTGP != nil {
+		tgp = &ncTGP.Duration
+	}
+	if tgp != nil {
+		stored := nodeClaim.DeepCopy()
+		nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{
+			v1.RebootTerminationGracePeriodAnnotationKey: tgp.String(),
+		})
+		if err := r.kubeClient.Patch(ctx, nodeClaim, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); err != nil {
+			return err
+		}
+	}
+	// Stamp DisruptionReason alongside Rebooting so evictions during the reboot drain are attributed to repair,
+	// matching what the queue stamps for a replace.
+	stored := nodeClaim.DeepCopy()
+	nodeClaim.StatusConditions(status.WithClock(r.clock)).SetTrueWithReason(v1.ConditionTypeDisruptionReason,
+		string(r.Reason()), string(r.Reason()))
+	nodeClaim.StatusConditions(status.WithClock(r.clock)).SetTrueWithReason(v1.ConditionTypeRebooting, v1.RebootReasonRequested,
+		fmt.Sprintf("rebooting for %s/%s", candidate.RepairCondition.Type, candidate.RepairCondition.Reason))
+	// Optimistic locking: the candidate comes from cluster state, which may lag the API server. A stale base must
+	// conflict (and requeue) rather than overwrite a newer reboot phase with RebootRequested.
+	if err := r.kubeClient.Status().Patch(ctx, nodeClaim, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); err != nil {
+		return err
+	}
+	// Write the committed NodeClaim into cluster state now, so the immediate requeue sees the node as rebooting
+	// (excluded from candidates, counted against budgets) instead of waiting on the informer.
+	r.cluster.UpdateNodeClaim(nodeClaim)
+	// The candidate is not RebootInProgress (ValidateNodeDisruptable excludes such nodes), so this is a fresh
+	// commit; record it once for the reboot->replace escalation window.
+	r.rebootHistory.RecordCommittedReboot(nodeClaim.UID)
+	log.FromContext(ctx).WithValues("NodeClaim", klog.KObj(nodeClaim)).Info("committed node reboot")
+	return nil
 }
 
 func (r *Repair) sortCandidates(candidates []*Candidate) {
