@@ -92,7 +92,7 @@ var _ = Describe("Reboot Lifecycle", func() {
 		node.Labels[v1.NodePoolLabelKey] = nodePool.Name
 		node.Labels[v1.NodeInitializedLabelKey] = "true"
 		node.Status.NodeInfo.BootID = "boot-1"
-		// A committed reboot request always carries a valid reboot termination grace period; 0s = forceful.
+		// Default to a forceful (0s) reboot; specs override the reboot termination grace period as needed.
 		nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{v1.RebootTerminationGracePeriodAnnotationKey: "0s"})
 		nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeInitialized)
 		nodeClaim.StatusConditions().SetTrueWithReason(v1.ConditionTypeRebooting, v1.RebootReasonRequested, "reboot requested")
@@ -303,11 +303,29 @@ var _ = Describe("Reboot Lifecycle", func() {
 			expectReplaced(nodeClaim, "provider_error")
 		})
 
-		It("fails with invalid_request when the reboot termination grace period is missing", func() {
+		It("drains without a deadline when the reboot termination grace period is absent", func() {
+			// Absent = unbounded graceful drain (termination's nil-TGP semantics), not an invalid request: the
+			// reboot waits for every pod to evict, however long that takes, and only then issues.
 			delete(nodeClaim.Annotations, v1.RebootTerminationGracePeriodAnnotationKey)
-			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			pod := test.Pod(test.PodOptions{NodeName: node.Name})
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node, pod)
+			result := ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
+			Expect(result.RequeueAfter).To(Equal(15 * time.Second)) // pollInterval: no deadline to requeue sooner for
+
+			env.Clock.Step(24 * time.Hour) // far past any bounded drain
 			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
-			expectInvalidRequest(nodeClaim)
+			Expect(cloudProvider.RebootCalls).To(BeEmpty())
+			ExpectExists(ctx, env.Client, pod)
+			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+			Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).Reason).To(Equal(v1.RebootReasonRequested))
+			Expect(recorder.Calls(events.RebootFailed)).To(Equal(0))
+
+			// Once the node is empty, the reboot issues.
+			ExpectDeleted(ctx, env.Client, pod)
+			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
+			Expect(cloudProvider.RebootCalls).To(HaveLen(1))
+			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+			Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).Reason).To(Equal(v1.RebootReasonIssued))
 		})
 
 		It("fails with invalid_request when the reboot termination grace period is malformed", func() {
