@@ -28,21 +28,21 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	kwok "sigs.k8s.io/karpenter/kwok/cloudprovider"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/test"
 )
 
-// These specs drive the reboot node action end-to-end on KWOK: repair matches a simulated reboot-clearable fault
-// (KWOKRebootRequired) and commits a reboot, and the reboot controller fences, drains, issues (KWOK gives the Node a new
-// boot ID), and observes the node's return.
+// These specs drive the reboot node action end-to-end: repair matches a reboot-clearable fault (env.RebootCondition())
+// and commits a reboot, and the reboot controller fences, drains, issues, and observes the node's return. KWOK defaults
+// to its simulated KWOKRebootRequired condition and simulates the reboot by changing the node's boot ID; other providers
+// pass --reboot-condition, and the specs skip without one.
 var _ = Describe("Reboot", func() {
 	var dep *appsv1.Deployment
 	var selector labels.Selector
 
 	BeforeEach(func() {
-		if !env.IsDefaultNodeClassKWOK() {
-			Skip("reboot specs inject KWOK-specific faults")
+		if _, ok := env.RebootCondition(); !ok {
+			Skip("reboot specs require --reboot-condition for this provider")
 		}
 		dep = test.Deployment(test.DeploymentOptions{
 			Replicas: 1,
@@ -53,27 +53,6 @@ var _ = Describe("Reboot", func() {
 		})
 		selector = labels.SelectorFromSet(dep.Spec.Selector.MatchLabels)
 	})
-
-	// setFault sets or clears the simulated reboot-clearable fault (KWOKRebootRequired) that KWOK's repair policies
-	// remediate with a reboot; KWOK's heartbeat stage re-emits it while present, and stops once it's removed. A set
-	// fault is backdated past the policy's toleration so repair acts on it immediately.
-	setFault := func(node *corev1.Node, active bool) {
-		GinkgoHelper()
-		node = env.ExpectExists(node).(*corev1.Node)
-		node.Status.Conditions = lo.Reject(node.Status.Conditions, func(c corev1.NodeCondition, _ int) bool {
-			return c.Type == kwok.KWOKRebootRequiredCondition
-		})
-		if active {
-			node.Status.Conditions = append(node.Status.Conditions, corev1.NodeCondition{
-				Type:               kwok.KWOKRebootRequiredCondition,
-				Status:             corev1.ConditionTrue,
-				Reason:             "E2ETest",
-				Message:            "injected reboot-clearable fault",
-				LastTransitionTime: metav1.Time{Time: time.Now().Add(-2 * time.Minute)},
-			})
-		}
-		env.ExpectStatusUpdated(node)
-	}
 
 	rebooting := func(g Gomega, nodeClaim *v1.NodeClaim) *v1.NodeClaim {
 		nc := &v1.NodeClaim{}
@@ -111,18 +90,19 @@ var _ = Describe("Reboot", func() {
 		nodeClaim := env.EventuallyExpectCreatedNodeClaimCount("==", 1)[0]
 		preBootID := node.Status.NodeInfo.BootID
 
-		setFault(node, true)
+		env.ExpectRebootFaultInjected(node)
 		// Repair commits the reboot: the fault is recorded as the reason, and the node is fenced while it drains.
 		Eventually(func(g Gomega) {
 			nc := rebooting(g, nodeClaim)
 			cond := nc.StatusConditions().Get(v1.ConditionTypeRebooting)
 			g.Expect(cond).ToNot(BeNil())
 			g.Expect(cond.IsTrue()).To(BeTrue())
-			g.Expect(cond.Message).To(ContainSubstring(string(kwok.KWOKRebootRequiredCondition)))
+			fault, _ := env.RebootCondition()
+			g.Expect(cond.Message).To(ContainSubstring(string(fault.Type)))
 			g.Expect(nc.StatusConditions().Get(v1.ConditionTypeDisruptionReason).IsTrue()).To(BeTrue())
 		}).Should(Succeed())
 		// The reboot clears the fault.
-		setFault(node, false)
+		env.ExpectRebootFaultCleared(node)
 		// The displaced pod waits for the node to return rather than triggering replacement capacity.
 		env.ConsistentlyExpectNodeClaimCountNotExceed(10*time.Second, 1)
 
@@ -144,7 +124,7 @@ var _ = Describe("Reboot", func() {
 		// The fault never clears. Repair's escalation is reboot, reboot, then replace: each reboot gives the node a
 		// new boot, so record every boot until the node is replaced. A boot stays visible for at least minDrainTime
 		// before the next reboot can issue, so polling every second doesn't miss one.
-		setFault(node, true)
+		env.ExpectRebootFaultInjected(node)
 		boots := map[string]bool{}
 		Eventually(func(g Gomega) {
 			n := &corev1.Node{}
@@ -196,7 +176,7 @@ var _ = Describe("Reboot", func() {
 		nodes := env.EventuallyExpectInitializedNodeCount("==", 3)
 		nodeClaims := env.EventuallyExpectCreatedNodeClaimCount("==", 3)
 		for _, node := range nodes {
-			setFault(node, true)
+			env.ExpectRebootFaultInjected(node)
 		}
 
 		// Every node is eligible at once, but the budget admits one reboot at a time. Clear each node's fault once
@@ -212,7 +192,7 @@ var _ = Describe("Reboot", func() {
 				case cond.IsTrue():
 					inFlight++
 					if !cleared[nc.Name] {
-						setFault(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: nc.Status.NodeName}}, false)
+						env.ExpectRebootFaultCleared(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: nc.Status.NodeName}})
 						cleared[nc.Name] = true
 					}
 				case cond.Reason == v1.RebootReasonSucceeded:

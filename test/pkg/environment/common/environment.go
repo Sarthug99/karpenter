@@ -66,6 +66,7 @@ var (
 	nodeClassPath   = flag.String("default-nodeclass", "", "Pass in a default cloud specific node class")
 	nodePoolPath    = flag.String("default-nodepool", "", "Pass in a default karpenter nodepool")
 	repairCondition = flag.String("repair-condition", "", "Pass in a <type>=<status>[/<reason>] node condition that matches a cloud provider RepairPolicy, for repair specs to inject")
+	rebootCondition = flag.String("reboot-condition", "", "Pass in a <type>=<status>[/<reason>] node condition that a cloud provider RepairPolicy remediates with a reboot, for reboot specs to inject")
 )
 
 type Environment struct {
@@ -195,6 +196,20 @@ func (env *Environment) RepairCondition() (corev1.NodeCondition, bool) {
 	}
 	if env.IsDefaultNodeClassKWOK() {
 		return corev1.NodeCondition{Type: kwokcloudprovider.KWOKUnhealthyCondition, Status: corev1.ConditionTrue}, true
+	}
+	return corev1.NodeCondition{}, false
+}
+
+// RebootCondition returns the node condition reboot specs inject to make repair reboot a node: --reboot-condition if
+// set, otherwise KWOK's simulated condition. A provider's policies must reboot it once it's about 11 minutes old (see
+// ExpectRebootFaultInjected) with no replace policy on the same condition eligible yet, and nothing on the node may
+// reset it. ok is false when the provider has none configured.
+func (env *Environment) RebootCondition() (corev1.NodeCondition, bool) {
+	if value := lo.FromPtr(rebootCondition); value != "" {
+		return parseCondition("reboot-condition", value), true
+	}
+	if env.IsDefaultNodeClassKWOK() {
+		return corev1.NodeCondition{Type: kwokcloudprovider.KWOKRebootRequiredCondition, Status: corev1.ConditionTrue}, true
 	}
 	return corev1.NodeCondition{}, false
 }
