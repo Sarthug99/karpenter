@@ -380,6 +380,13 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 		"command", cmd.String(),
 	}, cmd.LogValues()...)...).Info("disrupting node(s)")
 
+	// A reboot is in-place and already handed off to the reboot controller, which owns the fence, drain, and
+	// recovery. There is nothing to taint, replace, or wait on here; only record the decision.
+	if cmd.Decision() == RebootDecision {
+		q.recordDecisionPerformed(cmd)
+		return nil
+	}
+
 	// Cordon the old nodes before we launch the replacements to prevent new pods from scheduling to the old nodes
 	markedCandidates, markDisruptedErr := q.markDisrupted(ctx, cmd)
 	// If we get a failure marking some nodes as disrupted, if we are launching replacements, we shouldn't continue
@@ -428,6 +435,11 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 	q.Unlock()
 
 	// An action is only performed and pods/nodes are only disrupted after a successful add to the queue
+	q.recordDecisionPerformed(cmd)
+	return nil
+}
+
+func (q *Queue) recordDecisionPerformed(cmd *Command) {
 	nodePools := lo.Uniq(lo.Map(cmd.Candidates, func(c *Candidate, _ int) string {
 		return c.NodePool.Name
 	}))
@@ -444,7 +456,6 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 		metrics.ReasonLabel:    strings.ToLower(string(cmd.Reason())),
 		ConsolidationTypeLabel: cmd.ConsolidationType(),
 	})
-	return nil
 }
 
 func (q *Queue) releaseStaticReplacementReservationsIfOwned(cmd *Command, owned *bool) {

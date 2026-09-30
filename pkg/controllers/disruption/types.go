@@ -352,6 +352,9 @@ type Command struct {
 	Candidates          []*Candidate
 	Replacements        []*Replacement
 	PoolDisruptionCosts map[string]float64
+	// Reboot marks an in-place reboot of the candidates. The method has already handed the reboot off to the
+	// reboot controller, so the queue records the decision without tainting, replacing, or terminating.
+	Reboot bool
 }
 
 // Reason returns the disruption reason for this command.
@@ -368,6 +371,7 @@ var (
 	NoOpDecision    Decision = "no-op"
 	ReplaceDecision Decision = "replace"
 	DeleteDecision  Decision = "delete"
+	RebootDecision  Decision = "reboot"
 	// ApprovedDecision and RejectedDecision are the decision label values emitted
 	// by the Balanced consolidation move metrics (consolidation_moves_total and
 	// consolidation_score).
@@ -377,6 +381,8 @@ var (
 
 func (c Command) Decision() Decision {
 	switch {
+	case len(c.Candidates) > 0 && c.Reboot:
+		return RebootDecision
 	case len(c.Candidates) > 0 && len(c.Replacements) > 0:
 		return ReplaceDecision
 	case len(c.Candidates) > 0 && len(c.Replacements) == 0:
@@ -482,6 +488,10 @@ func (c Command) SourceCost() float64 {
 // available compatible offering contributes 0 to destination cost and inflates
 // them.
 func (c Command) EstimatedSavings() float64 {
+	// A reboot keeps the instance, so it saves nothing.
+	if c.Reboot {
+		return 0
+	}
 	sourcePrice := c.SourceCost()
 
 	// For delete consolidation, all source cost is savings

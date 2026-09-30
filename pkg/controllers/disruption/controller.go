@@ -154,9 +154,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	// Karpenter taints nodes with a karpenter.sh/disruption taint as part of the disruption process while it progresses in memory.
 	// If Karpenter restarts or fails with an error during a disruption action, some nodes can be left tainted.
 	// Idempotently remove this taint from candidates that are not in the orchestration queue before continuing.
-	outdatedNodes := lo.Reject(c.cluster.DeepCopyNodes(), func(s *state.StateNode, _ int) bool {
-		return c.queue.HasAny(s.ProviderID()) || s.MarkedForDeletion()
-	})
+	outdatedNodes := lo.Reject(c.cluster.DeepCopyNodes(), func(s *state.StateNode, _ int) bool { return c.disruptionInFlight(s) })
 	if err := state.RequireNoScheduleTaint(ctx, c.kubeClient, false, outdatedNodes...); err != nil {
 		if errors.IsConflict(err) {
 			return reconciler.Result{Requeue: true}, nil
@@ -242,6 +240,12 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 		return false, fmt.Errorf("disrupting candidates, %w", err)
 	}
 	return true, nil
+}
+
+// disruptionInFlight reports whether a node has a disruption action in progress. An in-flight reboot never enters
+// the queue, but still counts: it carries no disruption taint, and its DisruptionReason must survive the reboot's drain.
+func (c *Controller) disruptionInFlight(s *state.StateNode) bool {
+	return c.queue.HasAny(s.ProviderID()) || s.MarkedForDeletion() || s.RebootInProgress()
 }
 
 func (c *Controller) recordRun(s string) {
