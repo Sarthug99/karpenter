@@ -1,0 +1,229 @@
+/*
+Copyright The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package disruption_test
+
+import (
+	"time"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	"github.com/samber/lo"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	kwok "sigs.k8s.io/karpenter/kwok/cloudprovider"
+	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/test"
+)
+
+// These specs drive the reboot node action end-to-end on KWOK: repair matches a simulated reboot-clearable fault
+// (KWOKRebootRequired) and commits a reboot, and the reboot controller fences, drains, issues (KWOK gives the Node a new
+// boot ID), and observes the node's return.
+var _ = Describe("Reboot", func() {
+	var dep *appsv1.Deployment
+	var selector labels.Selector
+
+	BeforeEach(func() {
+		if !env.IsDefaultNodeClassKWOK() {
+			Skip("reboot specs inject KWOK-specific faults")
+		}
+		dep = test.Deployment(test.DeploymentOptions{
+			Replicas: 1,
+			PodOptions: test.PodOptions{
+				ObjectMeta:                    metav1.ObjectMeta{Labels: map[string]string{"app": "reboot"}},
+				TerminationGracePeriodSeconds: lo.ToPtr[int64](0),
+			},
+		})
+		selector = labels.SelectorFromSet(dep.Spec.Selector.MatchLabels)
+	})
+
+	// setFault sets or clears the simulated reboot-clearable fault (KWOKRebootRequired) that KWOK's repair policies
+	// remediate with a reboot; KWOK's heartbeat stage re-emits it while present, and stops once it's removed. A set
+	// fault is backdated past the policy's toleration so repair acts on it immediately.
+	setFault := func(node *corev1.Node, active bool) {
+		GinkgoHelper()
+		node = env.ExpectExists(node).(*corev1.Node)
+		node.Status.Conditions = lo.Reject(node.Status.Conditions, func(c corev1.NodeCondition, _ int) bool {
+			return c.Type == kwok.KWOKRebootRequiredCondition
+		})
+		if active {
+			node.Status.Conditions = append(node.Status.Conditions, corev1.NodeCondition{
+				Type:               kwok.KWOKRebootRequiredCondition,
+				Status:             corev1.ConditionTrue,
+				Reason:             "E2ETest",
+				Message:            "injected reboot-clearable fault",
+				LastTransitionTime: metav1.Time{Time: time.Now().Add(-2 * time.Minute)},
+			})
+		}
+		env.ExpectStatusUpdated(node)
+	}
+
+	rebooting := func(g Gomega, nodeClaim *v1.NodeClaim) *v1.NodeClaim {
+		nc := &v1.NodeClaim{}
+		g.Expect(env.Client.Get(env, client.ObjectKeyFromObject(nodeClaim), nc)).To(Succeed())
+		return nc
+	}
+
+	// expectRebootedInPlace waits for a reboot of nodeClaim to succeed, then checks it was in place: the same
+	// NodeClaim and Node, a new boot, the fence removed, the node re-initialized, and no replacement launched.
+	expectRebootedInPlace := func(nodeClaim *v1.NodeClaim, node *corev1.Node, preBootID string) {
+		GinkgoHelper()
+		Eventually(func(g Gomega) {
+			cond := rebooting(g, nodeClaim).StatusConditions().Get(v1.ConditionTypeRebooting)
+			g.Expect(cond).ToNot(BeNil())
+			g.Expect(cond.IsFalse()).To(BeTrue())
+			g.Expect(cond.Reason).To(Equal(v1.RebootReasonSucceeded))
+		}).Should(Succeed())
+		Eventually(func(g Gomega) {
+			n := &corev1.Node{}
+			g.Expect(env.Client.Get(env, client.ObjectKeyFromObject(node), n)).To(Succeed())
+			g.Expect(n.Status.NodeInfo.BootID).ToNot(Equal(preBootID))
+			g.Expect(n.Spec.Taints).ToNot(ContainElement(HaveField("Key", v1.RebootingTaintKey)))
+			g.Expect(n.Labels).To(HaveKeyWithValue(v1.NodeInitializedLabelKey, "true"))
+		}).Should(Succeed())
+		nodeClaims := env.EventuallyExpectCreatedNodeClaimCount("==", 1)
+		Expect(nodeClaims[0].Name).To(Equal(nodeClaim.Name))
+		Expect(nodeClaims[0].DeletionTimestamp.IsZero()).To(BeTrue())
+		env.EventuallyExpectHealthyPodCount(selector, 1)
+	}
+
+	It("should reboot a node in place when repair matches a reboot policy", func() {
+		env.ExpectCreated(nodeClass, nodePool, dep)
+		env.EventuallyExpectHealthyPodCount(selector, 1)
+		node := env.EventuallyExpectInitializedNodeCount("==", 1)[0]
+		nodeClaim := env.EventuallyExpectCreatedNodeClaimCount("==", 1)[0]
+		preBootID := node.Status.NodeInfo.BootID
+
+		setFault(node, true)
+		// Repair commits the reboot: the fault is recorded as the reason, and the node is fenced while it drains.
+		Eventually(func(g Gomega) {
+			nc := rebooting(g, nodeClaim)
+			cond := nc.StatusConditions().Get(v1.ConditionTypeRebooting)
+			g.Expect(cond).ToNot(BeNil())
+			g.Expect(cond.IsTrue()).To(BeTrue())
+			g.Expect(cond.Message).To(ContainSubstring(string(kwok.KWOKRebootRequiredCondition)))
+			g.Expect(nc.StatusConditions().Get(v1.ConditionTypeDisruptionReason).IsTrue()).To(BeTrue())
+		}).Should(Succeed())
+		// The reboot clears the fault.
+		setFault(node, false)
+		// The displaced pod waits for the node to return rather than triggering replacement capacity.
+		env.ConsistentlyExpectNodeClaimCountNotExceed(10*time.Second, 1)
+
+		expectRebootedInPlace(nodeClaim, node, preBootID)
+		// The cleared fault doesn't trigger another action.
+		Consistently(func(g Gomega) {
+			g.Expect(rebooting(g, nodeClaim).StatusConditions().Get(v1.ConditionTypeRebooting).Reason).To(Equal(v1.RebootReasonSucceeded))
+		}, 30*time.Second).Should(Succeed())
+		env.ExpectNodeClaimCount("==", 1)
+	})
+
+	It("should reboot twice, then replace, when the fault persists across reboots", func() {
+		env.ExpectCreated(nodeClass, nodePool, dep)
+		env.EventuallyExpectHealthyPodCount(selector, 1)
+		node := env.EventuallyExpectInitializedNodeCount("==", 1)[0]
+		nodeClaim := env.EventuallyExpectCreatedNodeClaimCount("==", 1)[0]
+		preBootID := node.Status.NodeInfo.BootID
+
+		// The fault never clears. Repair's escalation is reboot, reboot, then replace: each reboot gives the node a
+		// new boot, so record every boot until the node is replaced. A boot stays visible for at least minDrainTime
+		// before the next reboot can issue, so polling every second doesn't miss one.
+		setFault(node, true)
+		boots := map[string]bool{}
+		Eventually(func(g Gomega) {
+			n := &corev1.Node{}
+			if err := env.Client.Get(env, client.ObjectKeyFromObject(node), n); err == nil {
+				if n.Status.NodeInfo.BootID != preBootID {
+					boots[n.Status.NodeInfo.BootID] = true
+				}
+				g.Expect(n.DeletionTimestamp.IsZero()).To(BeFalse(), "node not yet replaced")
+			}
+		}).WithPolling(time.Second).Should(Succeed())
+		Expect(boots).To(HaveLen(2), "expected exactly two reboots before replacement")
+
+		env.EventuallyExpectNotFound(nodeClaim, node)
+		env.EventuallyExpectHealthyPodCount(selector, 1)
+		replacement := env.EventuallyExpectCreatedNodeClaimCount("==", 1)[0]
+		Expect(replacement.Name).ToNot(Equal(nodeClaim.Name))
+	})
+
+	It("should reboot a node handed off directly through the Rebooting condition", func() {
+		// Reboot is consumer-agnostic: any consumer commits one by stamping the drain bound and Rebooting on the
+		// NodeClaim, without going through repair.
+		env.ExpectCreated(nodeClass, nodePool, dep)
+		env.EventuallyExpectHealthyPodCount(selector, 1)
+		node := env.EventuallyExpectInitializedNodeCount("==", 1)[0]
+		nodeClaim := env.EventuallyExpectCreatedNodeClaimCount("==", 1)[0]
+		preBootID := node.Status.NodeInfo.BootID
+
+		nodeClaim = env.ExpectExists(nodeClaim).(*v1.NodeClaim)
+		nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{v1.RebootTerminationGracePeriodAnnotationKey: "0s"})
+		env.ExpectUpdated(nodeClaim)
+		nodeClaim = env.ExpectExists(nodeClaim).(*v1.NodeClaim)
+		nodeClaim.StatusConditions().SetTrueWithReason(v1.ConditionTypeRebooting, v1.RebootReasonRequested, "rebooting for e2e")
+		env.ExpectStatusUpdated(nodeClaim)
+
+		expectRebootedInPlace(nodeClaim, node, preBootID)
+	})
+
+	It("should not reboot more nodes at once than the disruption budget allows", func() {
+		nodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "1"}}
+		dep.Spec.Replicas = lo.ToPtr[int32](3)
+		dep.Spec.Template.Spec.Affinity = &corev1.Affinity{PodAntiAffinity: &corev1.PodAntiAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
+				TopologyKey:   corev1.LabelHostname,
+				LabelSelector: dep.Spec.Selector,
+			}},
+		}}
+		env.ExpectCreated(nodeClass, nodePool, dep)
+		env.EventuallyExpectHealthyPodCount(selector, 3)
+		nodes := env.EventuallyExpectInitializedNodeCount("==", 3)
+		nodeClaims := env.EventuallyExpectCreatedNodeClaimCount("==", 3)
+		for _, node := range nodes {
+			setFault(node, true)
+		}
+
+		// Every node is eligible at once, but the budget admits one reboot at a time. Clear each node's fault once
+		// its reboot is committed (the reboot clears it), and wait until all three have rebooted.
+		cleared := map[string]bool{}
+		Eventually(func(g Gomega) {
+			var inFlight, succeeded int
+			for _, nodeClaim := range nodeClaims {
+				nc := rebooting(g, nodeClaim)
+				cond := nc.StatusConditions().Get(v1.ConditionTypeRebooting)
+				switch {
+				case cond == nil:
+				case cond.IsTrue():
+					inFlight++
+					if !cleared[nc.Name] {
+						setFault(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: nc.Status.NodeName}}, false)
+						cleared[nc.Name] = true
+					}
+				case cond.Reason == v1.RebootReasonSucceeded:
+					succeeded++
+				}
+			}
+			if inFlight > 1 {
+				StopTrying("more reboots in flight than the disruption budget allows").Now()
+			}
+			g.Expect(succeeded).To(Equal(3))
+		}).WithPolling(time.Second).Should(Succeed())
+		env.ExpectNodeClaimCount("==", 3)
+	})
+})
