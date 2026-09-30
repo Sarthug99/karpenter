@@ -14,9 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package events defines the NodeClaim-targeted events emitted across the reboot lifecycle. Reboot state
-// lives on the NodeClaim (the Rebooting condition), so its events are emitted there too — co-located with
-// the condition rather than split across the Node.
+// Package events defines reboot lifecycle events emitted on the `NodeClaim`,
+// alongside the `Rebooting` condition.
 package events
 
 import (
@@ -28,8 +27,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/events"
 )
 
-// dedupeTimeout must exceed the reboot observation window so a per-phase event fires once, not once per
-// reconcile of the observe loop.
+// Exceed the reboot observation window so each phase event fires once.
 const dedupeTimeout = 30 * time.Minute
 
 func event(nodeClaim *v1.NodeClaim, eventType, reason, message string) events.Event {
@@ -38,8 +36,7 @@ func event(nodeClaim *v1.NodeClaim, eventType, reason, message string) events.Ev
 		Type:           eventType,
 		Reason:         reason,
 		Message:        message,
-		// Key dedupe on the reboot episode (the Rebooting condition's transition time), not just the
-		// NodeClaim UID, so a subsequent reboot on the same node isn't falsely deduped as the previous one.
+		// Include the reboot episode so a later reboot on the same NodeClaim isn't deduped.
 		DedupeValues:  []string{string(nodeClaim.UID), rebootEpisode(nodeClaim)},
 		DedupeTimeout: dedupeTimeout,
 	}

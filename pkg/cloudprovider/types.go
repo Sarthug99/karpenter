@@ -133,12 +133,11 @@ type CloudProvider interface {
 	// IsDrifted returns whether a NodeClaim has drifted from the provisioning requirements
 	// it is tied to.
 	IsDrifted(context.Context, *v1.NodeClaim) (DriftReason, error)
-	// Reboot restarts the instance backing the NodeClaim in place, without terminating it.
-	// The operationID identifies one logical reboot operation; providers with native request
-	// idempotency should map it to their deduplication mechanism so repeated calls for the same
-	// operation are replay-safe. Reboot returns once the provider accepts the request; node
-	// recovery is observed by the reboot controller, not awaited here. Providers that do not
-	// support in-place reboot must return a *NodeRebootNotImplementedError.
+	// Reboot restarts the instance backing the NodeClaim in place without terminating it.
+	// operationID identifies a logical reboot operation; providers with native idempotency should
+	// use it to make repeated calls for the same operation replay-safe. Reboot returns once the
+	// provider accepts the request; recovery is observed by the reboot controller. Providers that
+	// do not support in-place reboot must return a *NodeRebootNotImplementedError.
 	Reboot(ctx context.Context, nodeClaim *v1.NodeClaim, operationID string) error
 	// RepairPolicies returns the complete static set of provider-supported unhealthy-condition repair policies.
 	RepairPolicies() []RepairPolicy
