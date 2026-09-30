@@ -26,6 +26,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -163,8 +164,10 @@ var _ = Describe("Reboot", func() {
 	})
 
 	It("should not reboot more nodes at once than the disruption budget allows", func() {
+		// Two faulted nodes in a pool of 10 stay within repair's breaker (it trips only when more than ceil(20%) = 2
+		// nodes are unhealthy), so both are eligible at once and only the budget of 1 can keep them one at a time.
 		nodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "1"}}
-		dep.Spec.Replicas = lo.ToPtr[int32](3)
+		dep.Spec.Replicas = lo.ToPtr[int32](10)
 		dep.Spec.Template.Spec.Affinity = &corev1.Affinity{PodAntiAffinity: &corev1.PodAntiAffinity{
 			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
 				TopologyKey:   corev1.LabelHostname,
@@ -172,20 +175,23 @@ var _ = Describe("Reboot", func() {
 			}},
 		}}
 		env.ExpectCreated(nodeClass, nodePool, dep)
-		env.EventuallyExpectHealthyPodCount(selector, 3)
-		nodes := env.EventuallyExpectInitializedNodeCount("==", 3)
-		nodeClaims := env.EventuallyExpectCreatedNodeClaimCount("==", 3)
-		for _, node := range nodes {
+		env.EventuallyExpectHealthyPodCount(selector, 10)
+		nodes := env.EventuallyExpectInitializedNodeCount("==", 10)
+		nodeClaims := env.EventuallyExpectCreatedNodeClaimCount("==", 10)
+		faulted := sets.New(nodes[0].Name, nodes[1].Name)
+		for _, node := range nodes[:2] {
 			env.ExpectRebootFaultInjected(node)
 		}
 
-		// Every node is eligible at once, but the budget admits one reboot at a time. Clear each node's fault once
-		// its reboot is committed (the reboot clears it), and wait until all three have rebooted.
+		// Clear each node's fault once its reboot is committed (the reboot clears it), and wait until both have rebooted.
 		cleared := map[string]bool{}
 		Eventually(func(g Gomega) {
 			var inFlight, succeeded int
 			for _, nodeClaim := range nodeClaims {
 				nc := rebooting(g, nodeClaim)
+				if !faulted.Has(nc.Status.NodeName) {
+					continue
+				}
 				cond := nc.StatusConditions().Get(v1.ConditionTypeRebooting)
 				switch {
 				case cond == nil:
@@ -202,8 +208,8 @@ var _ = Describe("Reboot", func() {
 			if inFlight > 1 {
 				StopTrying("more reboots in flight than the disruption budget allows").Now()
 			}
-			g.Expect(succeeded).To(Equal(3))
+			g.Expect(succeeded).To(Equal(2))
 		}).WithPolling(time.Second).Should(Succeed())
-		env.ExpectNodeClaimCount("==", 3)
+		env.ExpectNodeClaimCount("==", 10)
 	})
 })
