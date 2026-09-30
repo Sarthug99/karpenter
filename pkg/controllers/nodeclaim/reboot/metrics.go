@@ -26,8 +26,7 @@ import (
 
 const resultLabel = "result"
 
-// Terminal reboot results. Bounded set; reboot metrics are deliberately fault-agnostic (the executor
-// does not interpret the driving fault), so no condition/reason label is emitted.
+// Terminal reboot results exposed through the result metric label.
 const (
 	resultSucceeded       = "succeeded"
 	resultProviderError   = "provider_error"
@@ -47,8 +46,7 @@ var Result = opmetrics.Label{
 	},
 }
 
-// rebootDurationBuckets span a few seconds to past the observation window (~21m), covering fast VMs
-// through slow bare-metal reboots.
+// Buckets span fast VM reboots through the observation window.
 var rebootDurationBuckets = prometheus.ExponentialBuckets(10, 2, 8) // 10,20,40,80,160,320,640,1280s
 
 var (
@@ -63,8 +61,7 @@ var (
 		[]opmetrics.Label{Result},
 		opmetrics.Beta,
 	)
-	// RebootDurationSeconds measures the whole reboot action: RebootRequested through the terminal
-	// outcome (includes fence + drain + issue + observe).
+	// Measures the full reboot lifecycle from request to terminal outcome.
 	RebootDurationSeconds = opmetrics.NewPrometheusHistogram(
 		crmetrics.Registry,
 		prometheus.HistogramOpts{
@@ -77,9 +74,7 @@ var (
 		[]opmetrics.Label{Result},
 		opmetrics.Beta,
 	)
-	// RebootRecoveryDurationSeconds measures pure reboot-to-recovery: issuance to a new boot rejoining
-	// (bootID changed + Ready). Drain-independent; recorded only on success. This is the signal used to
-	// size the observation window.
+	// Measures issuance-to-recovery time for successful reboots.
 	RebootRecoveryDurationSeconds = opmetrics.NewPrometheusHistogram(
 		crmetrics.Registry,
 		prometheus.HistogramOpts{

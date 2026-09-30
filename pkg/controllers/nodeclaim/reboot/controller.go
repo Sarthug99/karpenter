@@ -53,18 +53,13 @@ import (
 )
 
 const (
-	// observationWindow bounds how long we wait for a rebooted node to prove a new boot and rejoin
-	// after issuance before declaring RebootFailed. Beta uses a fixed value sized for slow instances.
+	// Maximum time to observe a new boot and Ready node after reboot issuance.
 	observationWindow = 20 * time.Minute
-	// pollInterval is how often we re-check for boot/readiness while observing recovery.
+	// How often reboot recovery is re-checked.
 	pollInterval = 15 * time.Second
-	// issuanceTimeout bounds the post-drain provider-accept retry loop before declaring RebootFailed. Mirrors
-	// nodeclaim lifecycle's LaunchTimeout. The issuance start is process-local (see Controller.issuanceStarted)
-	// and re-seeded on restart, so this bounds a window of continuous uptime, not a single durable deadline.
+	// Maximum time to retry provider acceptance after drain.
 	issuanceTimeout = 5 * time.Minute
-	// minDrainTime is the floor on the graceful drain window, applied even to a forceful (0s) reboot: a pod
-	// can bind to the node after the fence taint is applied but before scheduler informers catch up, so we
-	// make at least one graceful eviction pass over this window rather than letting it ride the reboot.
+	// Minimum graceful drain window, including forceful reboots, to catch late pod bindings.
 	// Mirrors the minimum-drain behavior from kubernetes-sigs/karpenter#2709.
 	minDrainTime = 5 * time.Second
 )
@@ -77,10 +72,8 @@ type Controller struct {
 	terminator    *terminator.Terminator
 	recorder      events.Recorder
 
-	// issuanceStartedMu guards issuanceStarted, the process-local record of when each episode's post-drain
-	// provider-accept loop began (keyed by NodeClaim UID). It bounds the issuance retry loop and is
-	// deliberately not persisted (avoids another annotation); a restart re-seeds it in reconcileRequested, so
-	// a restart restarts the issuance-timeout window rather than dropping the bound. See rebootDeadline.
+	// Tracks when each NodeClaim's provider-accept retry window started.
+	// Process-local; a restart re-seeds the timeout in reconcileRequested.
 	issuanceStartedMu sync.Mutex
 	issuanceStarted   map[types.UID]time.Time
 }
@@ -115,13 +108,13 @@ func (c *Controller) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (re
 	ctx = injection.WithControllerName(ctx, c.Name())
 
 	cond := nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting)
-	// Only active (True) reboots are driven here. Absent or terminal (False) => nothing to do.
+	// Only active reboots are reconciled here.
 	if cond == nil || !cond.IsTrue() {
 		return reconcile.Result{}, nil
 	}
-	// A reboot that failed into replacement leaves Rebooting=True on a deleting NodeClaim (see
-	// transitionToFailed); termination owns it from here.
+	// Deleting NodeClaims are handled by termination.
 	if !nodeClaim.DeletionTimestamp.IsZero() {
+		c.clearIssuanceStarted(nodeClaim.UID)
 		return reconcile.Result{}, nil
 	}
 
@@ -130,19 +123,20 @@ func (c *Controller) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (re
 		if !nodeclaimutils.IsNodeNotFoundError(err) {
 			return reconcile.Result{}, err
 		}
-		// The Node is gone mid-reboot: we can neither observe recovery nor clean the fence (it went with
-		// the Node). Fail if the deadline has elapsed, otherwise keep polling until it does — never a
-		// silent no-requeue stop, which would wedge the NodeClaim at Rebooting=True forever.
-		if c.pastRebootDeadline(nodeClaim) {
+		// If the Node disappears mid-reboot, keep polling until the reboot deadline before failing. Without a Node
+		// the drain can't run to start the issuance window, so bound that phase from the request instead.
+		deadline, ok := c.rebootDeadline(nodeClaim)
+		if !ok {
+			deadline = rebootRequestedAt(nodeClaim).Add(issuanceTimeout)
+		}
+		if c.clock.Now().After(deadline) {
 			result, msg := deadlineResult(nodeClaim)
 			return c.transitionToFailed(ctx, nodeClaim, nil, result, msg)
 		}
 		return reconcile.Result{RequeueAfter: pollInterval}, nil
 	}
 
-	// Bound every phase: a reboot that never issues (request phase) or never recovers (observe phase) is
-	// failed here rather than retrying forever, since Rebooting=True excludes the node from other
-	// disruption and advertises returning capacity to the scheduler.
+	// Fail reboots that exceed their phase deadline instead of retrying indefinitely.
 	if c.pastRebootDeadline(nodeClaim) {
 		result, msg := deadlineResult(nodeClaim)
 		return c.transitionToFailed(ctx, nodeClaim, node, result, msg)
@@ -158,34 +152,29 @@ func (c *Controller) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (re
 	}
 }
 
-// reconcileRequested applies the scheduling fence, drains (bounded), then issues the provider reboot.
+// reconcileRequested applies the scheduling fence, drains, then issues the provider reboot.
 func (c *Controller) reconcileRequested(ctx context.Context, nodeClaim *v1.NodeClaim, node *corev1.Node) (reconcile.Result, error) {
-	// Reject a malformed or negative reboot termination grace period terminally rather than guessing a drain
-	// mode. An absent one is valid and means an unbounded graceful drain.
+	// Invalid or negative termination grace periods fail the reboot; absent means unbounded drain.
 	tgp, err := rebootTerminationGracePeriod(nodeClaim)
 	if err != nil {
 		return c.transitionToFailed(ctx, nodeClaim, node, resultInvalidRequest, fmt.Sprintf("invalid reboot request: %v", err))
 	}
-	// Scheduling fence: reboot-owned taint that keeps evicted pods from rescheduling onto the pre-reboot boot.
+	// Fence new scheduling before draining.
 	if err := c.ensureRebootTaint(ctx, node); err != nil {
 		return reconcile.Result{}, err
 	}
 
-	// Restart-safety: once we've begun issuing (pre-boot bootID recorded), a changed bootID proves the
-	// reboot already happened — advance to observe without re-issuing.
 	preBootID, issuing := nodeClaim.Annotations[v1.RebootPreBootIDAnnotationKey]
 	if issuing {
-		// A changed bootID proves the reboot already happened — advance to observe without re-issuing.
+		// If bootID already changed, the reboot happened; move to observation without re-issuing.
 		if node.Status.NodeInfo.BootID != preBootID {
 			return c.transitionToIssued(ctx, nodeClaim, node)
 		}
-		// Resuming the issuance loop (e.g. after a controller restart): the issuance-start timestamp is
-		// process-local, so re-seed it when missing. This restarts the issuance-timeout window rather than
-		// dropping the bound — evading the timeout requires the controller to restart within every window.
+		// Re-seed the process-local issuance timeout after restart.
 		c.ensureIssuanceStarted(nodeClaim.UID)
 	}
 
-	// Drain before issuing (only before we've recorded pre-boot state; on resume after that, skip drain).
+	// Drain only before the first provider call.
 	if !issuing {
 		if done, res, err := c.drain(ctx, nodeClaim, node, tgp); err != nil || !done {
 			return res, err
@@ -196,29 +185,27 @@ func (c *Controller) reconcileRequested(ctx context.Context, nodeClaim *v1.NodeC
 		}
 	}
 
-	// Issue the reboot with a deterministic, per-episode operationID (stable across retries/restarts).
+	// Use a stable operationID across retries and restarts.
 	if err := c.cloudProvider.Reboot(ctx, nodeClaim, rebootOperationID(nodeClaim)); err != nil {
 		if cloudprovider.IsNodeRebootNotImplementedError(err) {
 			return c.transitionToFailed(ctx, nodeClaim, node, resultProviderError, "reboot not implemented by the cloud provider")
 		}
-		// Transient error: stay in RebootRequested and retry with backoff using the same operationID.
+		// Stay in RebootRequested and retry for transient provider errors.
 		return reconcile.Result{}, fmt.Errorf("issuing reboot, %w", err)
 	}
 	return c.transitionToIssued(ctx, nodeClaim, node)
 }
 
-// reconcileIssued observes recovery: remove the fence once the boot changes, succeed on a fresh boot +
-// Ready, fail if the observation window elapses first.
+// reconcileIssued observes reboot recovery and completes once the new boot is Ready.
 func (c *Controller) reconcileIssued(ctx context.Context, nodeClaim *v1.NodeClaim, node *corev1.Node) (reconcile.Result, error) {
-	// Re-enforce the RebootIssued invariant (idempotent) so a crash after the transition can't strand the label.
+	// Re-apply the issued-state invariant after restart.
 	if err := c.removeInitializedLabel(ctx, node); err != nil {
 		return reconcile.Result{}, err
 	}
 	preBootID := nodeClaim.Annotations[v1.RebootPreBootIDAnnotationKey]
 	bootChanged := node.Status.NodeInfo.BootID != preBootID
 
-	// The fence exists only while the pre-reboot boot may still be active. A changed bootID proves the
-	// new boot has begun, so remove it immediately (independent of readiness).
+	// Remove the scheduling fence as soon as the new boot is observed.
 	if bootChanged {
 		if err := c.removeRebootTaint(ctx, node); err != nil {
 			return reconcile.Result{}, err
@@ -230,19 +217,14 @@ func (c *Controller) reconcileIssued(ctx context.Context, nodeClaim *v1.NodeClai
 	if bootChanged && ready {
 		return c.transitionToSucceeded(ctx, nodeClaim, node)
 	}
-	// The observation-window timeout is enforced by the phase-agnostic deadline check in Reconcile.
+	// Timeout is enforced by Reconcile.
 	return reconcile.Result{RequeueAfter: pollInterval}, nil
 }
 
-// drain runs a graceful drain (eviction only, no cordon). Returns done=true when the drain completes or the
-// deadline elapses (residual pods ride the reboot). Every reboot holds for at least minDrainTime after it was
-// requested, even a forceful (0s) one and even when the node is already empty: a pod the scheduler bound
-// before its informers observed the fence taint may still land, and the floor gives it a graceful eviction
-// pass instead of letting it ride the reboot. With a reboot termination grace period, the drain deadline is
-// max(tgp, minDrainTime); without one (nil), the drain is unbounded, mirroring termination's nil-TGP behavior:
-// it waits until every pod has evicted.
+// drain evicts pods before reboot, with residual pods allowed to ride the reboot post deadline.
+// Every reboot observes at least minDrainTime to catch late pod bindings.
 func (c *Controller) drain(ctx context.Context, nodeClaim *v1.NodeClaim, node *corev1.Node, tgp *time.Duration) (done bool, res reconcile.Result, err error) {
-	// Deadlines are measured from when the reboot was requested (the Rebooting condition's transition).
+	// Drain deadlines are measured from when the reboot was requested.
 	floor := rebootRequestedAt(nodeClaim).Add(minDrainTime)
 	var deadline *time.Time
 	if tgp != nil {
@@ -252,8 +234,7 @@ func (c *Controller) drain(ctx context.Context, nodeClaim *v1.NodeClaim, node *c
 		if !terminator.IsNodeDrainError(err) {
 			return false, reconcile.Result{}, fmt.Errorf("draining node, %w", err)
 		}
-		// Pods still draining: re-check every pollInterval (or sooner as the deadline nears) so we advance as
-		// soon as the node is empty, then proceed with residual pods riding once the deadline elapses.
+		// Keep polling while pods are still draining.
 		if deadline == nil {
 			return false, reconcile.Result{RequeueAfter: pollInterval}, nil
 		}
@@ -262,21 +243,18 @@ func (c *Controller) drain(ctx context.Context, nodeClaim *v1.NodeClaim, node *c
 		}
 		return true, reconcile.Result{}, nil // deadline elapsed (always at or past the floor)
 	}
-	// Drained, but hold until the floor so a late-binding pod is still caught by a later drain pass.
+	// Hold through the minimum drain window to catch late bindings.
 	if remaining := floor.Sub(c.clock.Now()); remaining > 0 {
 		return false, reconcile.Result{RequeueAfter: remaining}, nil
 	}
 	return true, reconcile.Result{}, nil
 }
 
-// recordIssuingState records the pre-reboot bootID before the first provider call, so a changed bootID
-// afterward proves the reboot happened (restart-safety) and terminal cleanup can scope to this episode.
+// recordIssuingState persists the pre-reboot bootID before the first provider call.
 func (c *Controller) recordIssuingState(ctx context.Context, nodeClaim *v1.NodeClaim, node *corev1.Node) error {
-	// Anchor the post-drain issuance timeout in memory (drain-completion time). It only bounds the
-	// provider-accept retry loop, so it isn't persisted; a restart re-seeds it in reconcileRequested.
+	// Start the process-local provider-accept timeout.
 	c.ensureIssuanceStarted(nodeClaim.UID)
-	// The pre-reboot bootID must be durable: restart-safety and the operationID both derive from it, so a
-	// changed bootID after a restart still proves the reboot happened. Persist it before the provider call.
+	// Persist bootID for restart-safe reboot detection and operationID generation.
 	if nodeClaim.Annotations[v1.RebootPreBootIDAnnotationKey] == node.Status.NodeInfo.BootID {
 		return nil
 	}
@@ -287,8 +265,7 @@ func (c *Controller) recordIssuingState(ctx context.Context, nodeClaim *v1.NodeC
 	return c.kubeClient.Patch(ctx, nodeClaim, client.MergeFrom(stored))
 }
 
-// ensureIssuanceStarted records the issuance-start time for this episode if not already set (set-if-absent),
-// so the first drain-completion or a post-restart resume seeds it and repeated calls are no-ops.
+// ensureIssuanceStarted records the issuance start time once per process.
 func (c *Controller) ensureIssuanceStarted(uid types.UID) {
 	c.issuanceStartedMu.Lock()
 	defer c.issuanceStartedMu.Unlock()
@@ -305,11 +282,10 @@ func (c *Controller) clearIssuanceStarted(uid types.UID) {
 
 func (c *Controller) transitionToIssued(ctx context.Context, nodeClaim *v1.NodeClaim, node *corev1.Node) (reconcile.Result, error) {
 	stored := nodeClaim.DeepCopy()
-	// Carry the driving-fault message forward across the phase change; the reason marks the phase (Issued).
+	// Preserve the fault message while advancing to Issued.
 	cond := nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting)
 	nodeClaim.StatusConditions().SetTrueWithReason(v1.ConditionTypeRebooting, v1.RebootReasonIssued, cond.Message)
-	// Initialization is scoped to a boot; the Initialized->Unknown transition also stamps issuedAt. It's set
-	// at issue time, so the reason is Rebooting (the reboot is in flight), not RebootRequested.
+	// Initialization is boot-scoped; mark it Unknown while rebooting.
 	nodeClaim.StatusConditions().SetUnknownWithReason(v1.ConditionTypeInitialized, v1.RebootReasonRebooting, "node is rebooting")
 	if !equality.Semantic.DeepEqual(stored, nodeClaim) {
 		if err := c.kubeClient.Status().Patch(ctx, nodeClaim, client.MergeFrom(stored)); err != nil {
@@ -327,7 +303,7 @@ func (c *Controller) transitionToSucceeded(ctx context.Context, nodeClaim *v1.No
 	if err := c.removeRebootTaint(ctx, node); err != nil {
 		return reconcile.Result{}, err
 	}
-	// Capture durations before setTerminal resets the Rebooting condition's transition time.
+	// Capture durations before the terminal transition resets transition time.
 	duration := c.clock.Since(rebootRequestedAt(nodeClaim))
 	recovery, hasRecovery := time.Duration(0), false
 	if issuedAt, ok := c.issuedAt(nodeClaim); ok {
@@ -336,20 +312,17 @@ func (c *Controller) transitionToSucceeded(ctx context.Context, nodeClaim *v1.No
 	if err := c.setTerminal(ctx, nodeClaim, v1.RebootReasonSucceeded, "node rebooted and rejoined the cluster"); err != nil {
 		return reconcile.Result{}, err
 	}
-	// Record metrics only after the terminal patch is durable, so a patch-conflict requeue can't re-enter
-	// this branch and double-count.
+	// Record metrics only after the terminal state is persisted.
 	recordTerminalMetrics(resultSucceeded, duration)
 	if hasRecovery {
-		// Recovery duration (drain-independent): issuance -> new boot rejoined. Success only — a timed-out
-		// reboot never recovered, so it has no recovery time (this is why it's not observed on failure).
+		// Recovery time is measured from issuance to rejoin.
 		RebootRecoveryDurationSeconds.Observe(recovery.Seconds(), map[string]string{})
 	}
 	return reconcile.Result{}, nil
 }
 
 func (c *Controller) transitionToFailed(ctx context.Context, nodeClaim *v1.NodeClaim, node *corev1.Node, result, msg string) (reconcile.Result, error) {
-	// Terminal cleanup: ensure the reboot-owned fence is removed even if the boot never changed. node may
-	// be nil when it was deleted mid-reboot, in which case the fence went with it — nothing to clean.
+	// Remove the reboot fence when the Node still exists.
 	if node != nil {
 		if err := c.removeRebootTaint(ctx, node); err != nil {
 			return reconcile.Result{}, err
@@ -357,35 +330,26 @@ func (c *Controller) transitionToFailed(ctx context.Context, nodeClaim *v1.NodeC
 	}
 	duration := c.clock.Since(rebootRequestedAt(nodeClaim))
 	if result == resultInvalidRequest {
-		// A pre-drain invalid request left the node untouched, so it isn't replaced (it's a producer-contract
-		// violation). Record the terminal RebootFailed so the lifecycle ends.
+		// Invalid requests fail without replacing the node.
 		if err := c.setTerminal(ctx, nodeClaim, v1.RebootReasonFailed, msg); err != nil {
 			return reconcile.Result{}, err
 		}
 	} else {
-		// Escalate to replacement: a reboot that reached the drain step already disrupted the node (its
-		// workloads were drained/fenced and it may be NotReady/uninitialized), so it can't be cleanly returned
-		// to service. Delete the NodeClaim — the termination finalizer drains + terminates and provisioning
-		// replaces it. Like a launch ICE, we don't record a terminal condition on a NodeClaim that is going
-		// away: Rebooting stays True, so a failed delete re-enters this path on the next reconcile and retries.
-		// The resourceVersion precondition makes a repeat reconcile on a stale cache (the delete already
-		// happened) conflict instead of re-emitting the event and metrics.
+		// Reboot failures after disruption escalate to NodeClaim replacement.
 		if err := c.kubeClient.Delete(ctx, nodeClaim, client.Preconditions{ResourceVersion: lo.ToPtr(nodeClaim.ResourceVersion)}); err != nil {
 			return reconcile.Result{}, client.IgnoreNotFound(err)
 		}
 		c.clearIssuanceStarted(nodeClaim.UID)
 		log.FromContext(ctx).WithValues("result", result).Info("reboot failed, replacing node")
 	}
-	// Record events/metrics only after the terminal write is durable, so a failed write can't double-count.
+	// Record events and metrics only after the terminal write succeeds.
 	c.recorder.Publish(rebootevents.RebootFailed(nodeClaim, msg))
 	recordTerminalMetrics(result, duration)
 	return reconcile.Result{}, nil
 }
 
 func (c *Controller) setTerminal(ctx context.Context, nodeClaim *v1.NodeClaim, reason, msg string) error {
-	// Clear episode-scoped reboot state first, so a later reboot on this NodeClaim starts clean and the
-	// restart-safety check can't misfire on a prior episode's pre-boot bootID. The issuance start is
-	// in-memory (see recordIssuingState); the pre-boot bootID is the only persisted episode annotation.
+	// Clear episode-scoped state so a later reboot starts clean.
 	c.clearIssuanceStarted(nodeClaim.UID)
 	if _, hadPreBoot := nodeClaim.Annotations[v1.RebootPreBootIDAnnotationKey]; hadPreBoot {
 		stored := nodeClaim.DeepCopy()
@@ -432,10 +396,7 @@ func (c *Controller) removeInitializedLabel(ctx context.Context, node *corev1.No
 	return c.kubeClient.Patch(ctx, node, client.MergeFrom(stored))
 }
 
-// rebootTerminationGracePeriod reads the consumer-stamped reboot termination grace period (the drain bound):
-// absent = unbounded graceful (nil, mirroring termination's nil-TGP semantics), 0s = forceful,
-// >0 = graceful-bounded. Malformed or negative is a producer contract violation, so it's an error the caller
-// fails terminally rather than silently selecting a drain mode.
+// Reads the reboot drain bound: absent = unbounded, 0 = forceful, >0 = graceful.
 func rebootTerminationGracePeriod(nodeClaim *v1.NodeClaim) (*time.Duration, error) {
 	value, ok := nodeClaim.Annotations[v1.RebootTerminationGracePeriodAnnotationKey]
 	if !ok {
@@ -451,8 +412,7 @@ func rebootTerminationGracePeriod(nodeClaim *v1.NodeClaim) (*time.Duration, erro
 	return &d, nil
 }
 
-// issuedAt derives the issuance time from the Initialized condition, which transitions to Unknown exactly
-// when the reboot is issued and is held there (by the initialization guard) until the reboot is terminal.
+// Derives reboot issuance time from Initialized transitioning to Unknown.
 func (c *Controller) issuedAt(nodeClaim *v1.NodeClaim) (time.Time, bool) {
 	cond := nodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized)
 	if cond == nil || cond.Status != metav1.ConditionUnknown {
@@ -461,9 +421,7 @@ func (c *Controller) issuedAt(nodeClaim *v1.NodeClaim) (time.Time, bool) {
 	return cond.LastTransitionTime.Time, true
 }
 
-// issuanceStartedAt returns when this episode's post-drain provider-accept loop began, if the controller
-// recorded it in memory during this process lifetime. It's absent before the drain completes and after a
-// controller restart; in the latter case the issuance timeout simply does not apply (see rebootDeadline).
+// Returns the process-local start of the provider-accept retry window.
 func (c *Controller) issuanceStartedAt(nodeClaim *v1.NodeClaim) (time.Time, bool) {
 	c.issuanceStartedMu.Lock()
 	defer c.issuanceStartedMu.Unlock()
@@ -471,23 +429,16 @@ func (c *Controller) issuanceStartedAt(nodeClaim *v1.NodeClaim) (time.Time, bool
 	return t, ok
 }
 
-// rebootDeadline is the wall-clock bound for the current phase, after which the reboot is failed. It is
-// derived only from the NodeClaim (never the Node), so it fires even when the Node has been deleted. The
-// bool is false when the current phase has no bound, in which case the reboot keeps polling rather than
-// failing.
+// Returns the deadline for the current reboot phase, if bounded.
 func (c *Controller) rebootDeadline(nodeClaim *v1.NodeClaim) (time.Time, bool) {
 	if nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).Reason == v1.RebootReasonIssued {
-		// Observation window, anchored on the durable Initialized->Unknown transition (see issuedAt), so it
-		// bounds recovery even across controller restarts.
+		// Recovery is bounded from the durable issuance transition.
 		if issuedAt, ok := c.issuedAt(nodeClaim); ok {
 			return issuedAt.Add(observationWindow), true
 		}
 		return time.Time{}, false
 	}
-	// RebootRequested: bound the post-drain provider-accept loop from the process-local issuance start. Before
-	// the drain completes (or on the first reconcile after a restart, before reconcileRequested re-seeds the
-	// start) there's no bound for that pass; drain() bounds itself, and the re-seed restarts the window on the
-	// next pass. Evading the timeout therefore requires the controller to restart within every window.
+	// Issuance is bounded from the process-local provider-accept start.
 	if startedAt, ok := c.issuanceStartedAt(nodeClaim); ok {
 		return startedAt.Add(issuanceTimeout), true
 	}
@@ -499,8 +450,7 @@ func (c *Controller) pastRebootDeadline(nodeClaim *v1.NodeClaim) bool {
 	return ok && c.clock.Now().After(deadline)
 }
 
-// deadlineResult maps the current phase to the terminal result label and message used when the deadline
-// elapses: the request phase failed to issue (provider_error); the observe phase failed to recover.
+// Maps a phase timeout to its terminal result.
 func deadlineResult(nodeClaim *v1.NodeClaim) (result, msg string) {
 	if nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).Reason == v1.RebootReasonIssued {
 		return resultRecoveryTimeout, "node did not recover within the observation window"
@@ -508,25 +458,17 @@ func deadlineResult(nodeClaim *v1.NodeClaim) (result, msg string) {
 	return resultProviderError, "reboot was not issued within the issuance timeout"
 }
 
-// rebootRequestedAt is when the current reboot episode was committed: the Rebooting condition's transition
-// to True. operatorpkg preserves LastTransitionTime across the RebootRequested->RebootIssued reason change
-// (status stays True), so this is stable for the whole episode until the terminal SetFalse.
+// Returns when the current reboot episode was requested.
 func rebootRequestedAt(nodeClaim *v1.NodeClaim) time.Time {
 	return nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).LastTransitionTime.Time
 }
 
-// rebootOperationID is a deterministic, per-episode idempotency key passed to CloudProvider.Reboot: stable
-// across retries and controller restarts within an episode, and distinct across episodes. Derived from the
-// request time and the pre-reboot bootID (recorded before issuing) rather than stored, so no annotation is
-// needed and stale keys can't leak. The bootID disambiguates episodes within the same second, since
-// metav1.Time (the request time's source) only round-trips at second precision.
+// Returns a stable per-episode idempotency key for provider reboot calls.
 func rebootOperationID(nodeClaim *v1.NodeClaim) string {
 	return fmt.Sprintf("%s-%d-%s", nodeClaim.UID, rebootRequestedAt(nodeClaim).UnixNano(), nodeClaim.Annotations[v1.RebootPreBootIDAnnotationKey])
 }
 
-// recordTerminalMetrics counts the reboot by result and observes the full-action duration (request ->
-// terminal). Called only after the terminal condition patch succeeds, so a patch-conflict requeue cannot
-// re-enter the terminal branch and double-count.
+// Records the terminal result and total reboot duration.
 func recordTerminalMetrics(result string, duration time.Duration) {
 	RebootsTotal.Inc(map[string]string{resultLabel: result})
 	RebootDurationSeconds.Observe(duration.Seconds(), map[string]string{resultLabel: result})

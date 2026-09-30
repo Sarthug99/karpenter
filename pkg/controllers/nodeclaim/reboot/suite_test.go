@@ -106,7 +106,7 @@ var _ = Describe("Reboot Lifecycle", func() {
 		node.Labels[v1.NodePoolLabelKey] = nodePool.Name
 		node.Labels[v1.NodeInitializedLabelKey] = "true"
 		node.Status.NodeInfo.BootID = "boot-1"
-		// Default to a forceful (0s) reboot; specs override the reboot termination grace period as needed.
+		// Default to forceful reboot; individual specs override as needed.
 		nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{v1.RebootTerminationGracePeriodAnnotationKey: "0s"})
 		nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeInitialized)
 		nodeClaim.StatusConditions().SetTrueWithReason(v1.ConditionTypeRebooting, v1.RebootReasonRequested, "reboot requested")
@@ -125,14 +125,12 @@ var _ = Describe("Reboot Lifecycle", func() {
 		cond := nc.StatusConditions().Get(v1.ConditionTypeRebooting)
 		Expect(cond.IsFalse()).To(BeTrue())
 		Expect(cond.Reason).To(Equal(v1.RebootReasonFailed))
-		Expect(nc.DeletionTimestamp.IsZero()).To(BeTrue()) // invalid_request is pre-drain: node is NOT replaced
-		Expect(cloudProvider.RebootCalls).To(BeEmpty())    // never issued — failed on the invalid request
+		Expect(nc.DeletionTimestamp.IsZero()).To(BeTrue())
+		Expect(cloudProvider.RebootCalls).To(BeEmpty())
 		ExpectMetricCounterValue(reboot.RebootsTotal, 1, map[string]string{"result": "invalid_request"})
 	}
 
-	// expectReplaced asserts a failed reboot on a drained node escalated to replacement: the reboot controller
-	// deleted the NodeClaim (gone, or deleting if a finalizer is present) and recorded the outcome. Like a launch
-	// ICE, no terminal condition is written on a NodeClaim that is going away: Rebooting stays True.
+	// A failed post-drain reboot should escalate to NodeClaim replacement.
 	expectReplaced := func(nc *v1.NodeClaim, result string) {
 		Expect(recorder.Calls(events.RebootFailed)).To(Equal(1))
 		ExpectMetricCounterValue(reboot.RebootsTotal, 1, map[string]string{"result": result})
@@ -145,14 +143,12 @@ var _ = Describe("Reboot Lifecycle", func() {
 		}
 	}
 
-	// stepPastDrainFloor advances past the minDrainTime floor every reboot holds for after it was requested,
-	// so an already-empty node issues on the next reconcile.
+	// Advance past the minimum drain window.
 	stepPastDrainFloor := func() { env.Clock.Step(6 * time.Second) }
 
 	Context("RebootRequested", func() {
 		It("holds for minDrainTime before issuing, even when there is nothing to drain", func() {
-			// A pod the scheduler bound before its informers observed the fence taint may still land; the floor
-			// gives it a graceful eviction pass rather than letting it ride the reboot.
+			// Allows a late binding pod one graceful eviction pass.
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 			result := ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
 			Expect(cloudProvider.RebootCalls).To(BeEmpty())
@@ -180,7 +176,7 @@ var _ = Describe("Reboot Lifecycle", func() {
 			Expect(cond.Message).To(Equal("reboot requested")) // driving-fault message carried forward from RebootRequested
 			Expect(nodeClaim.Annotations).To(HaveKeyWithValue(v1.RebootPreBootIDAnnotationKey, "boot-1"))
 			Expect(cloudProvider.RebootOperationIDs[0]).ToNot(BeEmpty())
-			// A committed reboot invalidates Initialized (True -> Unknown) until the node re-initializes.
+			// A committed reboot invalidates Initialized until the node re-initializes.
 			initialized := nodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized)
 			Expect(initialized.Status).To(Equal(metav1.ConditionUnknown))
 			Expect(initialized.Reason).To(Equal(v1.RebootReasonRebooting))
@@ -191,7 +187,7 @@ var _ = Describe("Reboot Lifecycle", func() {
 		})
 
 		It("re-issues on a subsequent reboot of the same NodeClaim (no stale-state false success)", func() {
-			// Episode 1: request -> issue -> succeed.
+			// Episode 1: issue and succeed.
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 			stepPastDrainFloor()
 			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
@@ -206,12 +202,12 @@ var _ = Describe("Reboot Lifecycle", func() {
 			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
 			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
 			Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).Reason).To(Equal(v1.RebootReasonSucceeded))
-			// Episode-scoped state is cleared at terminal, so it can't leak into the next reboot.
+			// Episode-scoped state must not leak into the next reboot.
 			Expect(nodeClaim.Annotations).ToNot(HaveKey(v1.RebootPreBootIDAnnotationKey))
 
-			// Episode 2: the node has re-initialized and the consumer re-requests a reboot on the same NodeClaim.
+			// Episode 2: request another reboot on the same NodeClaim.
 			node = ExpectExists(ctx, env.Client, node)
-			node.Status.NodeInfo.BootID = "boot-2" // current boot; a stale pre-boot-id would falsely "prove" a reboot
+			node.Status.NodeInfo.BootID = "boot-2"
 			ExpectApplied(ctx, env.Client, node)
 			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
 			nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeInitialized)
@@ -220,7 +216,7 @@ var _ = Describe("Reboot Lifecycle", func() {
 			stepPastDrainFloor()
 			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
 
-			// The second episode must actually issue — not short-circuit to success on stale state.
+			// Must issue again rather than treating stale state as a completed reboot.
 			Expect(cloudProvider.RebootCalls).To(HaveLen(2))
 			Expect(cloudProvider.RebootOperationIDs[1]).ToNot(Equal(firstID)) // distinct per episode
 			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
@@ -278,16 +274,14 @@ var _ = Describe("Reboot Lifecycle", func() {
 		})
 
 		It("makes a minDrainTime graceful pass on a forceful (0s) reboot when a pod is present", func() {
-			// Even a forceful (0s) reboot drains for at least minDrainTime: a pod that bound after the fence
-			// taint but before scheduler informers synced is evicted gracefully rather than riding the reboot.
-			// So with a drainable pod present the reboot does NOT issue in the first reconcile; it requeues.
+			// Give late-bound pods one graceful eviction pass.
 			pod := test.Pod(test.PodOptions{NodeName: node.Name})
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node, pod)
 			result := ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
 
-			Expect(cloudProvider.RebootCalls).To(BeEmpty()) // draining, not yet issued
+			Expect(cloudProvider.RebootCalls).To(BeEmpty())
 			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
-			Expect(result.RequeueAfter).To(BeNumerically("<=", 5*time.Second)) // bounded by minDrainTime
+			Expect(result.RequeueAfter).To(BeNumerically("<=", 5*time.Second))
 			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
 			Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).Reason).To(Equal(v1.RebootReasonRequested))
 		})
@@ -295,66 +289,61 @@ var _ = Describe("Reboot Lifecycle", func() {
 		It("issues a forceful (0s) reboot after the minDrainTime window elapses with a pod present", func() {
 			pod := test.Pod(test.PodOptions{NodeName: node.Name})
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node, pod)
-			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim) // first pass: draining
+			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
 			Expect(cloudProvider.RebootCalls).To(BeEmpty())
 
-			env.Clock.Step(6 * time.Second) // past the minDrainTime floor
+			env.Clock.Step(6 * time.Second)
 			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
 
-			Expect(cloudProvider.RebootCalls).To(HaveLen(1)) // residual pod rides the reboot
+			Expect(cloudProvider.RebootCalls).To(HaveLen(1))
 			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
 			Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).Reason).To(Equal(v1.RebootReasonIssued))
 		})
 
 		It("fails with provider_error when issuance does not succeed within the issuance timeout", func() {
-			// The first reconcile records the (in-memory) issuance start and then hits a transient provider
-			// error, so the reboot stays in the post-drain provider-accept loop (RebootRequested). Once the
-			// clock passes the 5m issuance timeout, the next reconcile fails it at the deadline.
+			// First reconcile starts the issuance window; a later reconcile enforces the timeout.
 			cloudProvider.NextRebootErr = fmt.Errorf("throttled")
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 			stepPastDrainFloor()
 			_ = ExpectObjectReconcileFailed(ctx, env.Client, rebootController, nodeClaim)
 			Expect(cloudProvider.RebootCalls).To(BeEmpty())
 
-			env.Clock.Step(6 * time.Minute) // past the 5m issuance timeout
+			env.Clock.Step(6 * time.Minute)
 			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
 
-			Expect(cloudProvider.RebootCalls).To(BeEmpty()) // failed at the deadline, never successfully issued
+			Expect(cloudProvider.RebootCalls).To(BeEmpty())
 			expectReplaced(nodeClaim, "provider_error")
 		})
 
 		It("re-seeds the issuance timer on restart and still enforces the timeout", func() {
-			// Simulate a restart mid-issuance: pre-boot bootID is persisted (issuing) but the process-local
-			// issuance start is gone. The reconcile re-seeds the start, so the timeout restarts as a fresh
-			// window rather than being lost — and it still fires once that window elapses.
+			// Simulate restart with persisted issuing state but no in-memory timer.
 			nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{
 				v1.RebootPreBootIDAnnotationKey: "boot-1",
 			})
-			node.Status.NodeInfo.BootID = "boot-1" // unchanged boot: restart-safety doesn't short-circuit to Issued
+			node.Status.NodeInfo.BootID = "boot-1"
 			cloudProvider.NextRebootErr = fmt.Errorf("throttled")
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 
-			// First reconcile after the "restart" re-seeds the timer (no deadline yet) and stays RebootRequested.
+			// First reconcile re-seeds the issuance timer.
 			_ = ExpectObjectReconcileFailed(ctx, env.Client, rebootController, nodeClaim)
 			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
 			Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).Reason).To(Equal(v1.RebootReasonRequested))
 
-			// The re-seeded timer still fires: past the fresh 5m window, the reboot fails and replaces the node.
+			// The re-seeded timer still enforces the timeout.
 			env.Clock.Step(6 * time.Minute)
 			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
 			expectReplaced(nodeClaim, "provider_error")
 		})
 
 		It("drains without a deadline when the reboot termination grace period is absent", func() {
-			// Absent = unbounded graceful drain (termination's nil-TGP semantics), not an invalid request: the
-			// reboot waits for every pod to evict, however long that takes, and only then issues.
+			// Absent grace period means an unbounded graceful drain.
 			delete(nodeClaim.Annotations, v1.RebootTerminationGracePeriodAnnotationKey)
 			pod := test.Pod(test.PodOptions{NodeName: node.Name})
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node, pod)
 			result := ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
-			Expect(result.RequeueAfter).To(Equal(15 * time.Second)) // pollInterval: no deadline to requeue sooner for
+			Expect(result.RequeueAfter).To(Equal(15 * time.Second))
 
-			env.Clock.Step(24 * time.Hour) // far past any bounded drain
+			env.Clock.Step(24 * time.Hour)
 			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
 			Expect(cloudProvider.RebootCalls).To(BeEmpty())
 			ExpectExists(ctx, env.Client, pod)
@@ -368,6 +357,17 @@ var _ = Describe("Reboot Lifecycle", func() {
 			Expect(cloudProvider.RebootCalls).To(HaveLen(1))
 			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
 			Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).Reason).To(Equal(v1.RebootReasonIssued))
+		})
+
+		It("fails when the node is gone before the drain and the issuance timeout elapses", func() {
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim) // node intentionally not applied
+			result := ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
+			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+			Expect(ExpectExists(ctx, env.Client, nodeClaim).StatusConditions().Get(v1.ConditionTypeRebooting).Reason).To(Equal(v1.RebootReasonRequested))
+
+			env.Clock.Step(6 * time.Minute)
+			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
+			expectReplaced(nodeClaim, "provider_error")
 		})
 
 		It("fails with invalid_request when the reboot termination grace period is malformed", func() {
@@ -391,15 +391,13 @@ var _ = Describe("Reboot Lifecycle", func() {
 				v1.RebootPreBootIDAnnotationKey: "boot-1",
 			})
 			nodeClaim.StatusConditions().SetTrueWithReason(v1.ConditionTypeRebooting, v1.RebootReasonIssued, "reboot issued")
-			// issuedAt is derived from the Initialized->Unknown transition, set at issue time.
+			// issuedAt is derived from this transition.
 			nodeClaim.StatusConditions().SetUnknownWithReason(v1.ConditionTypeInitialized, v1.RebootReasonRebooting, "node is rebooting")
 			node.Spec.Taints = append(node.Spec.Taints, v1.RebootingNoScheduleTaint)
 		})
 
 		It("clears the initialized label in the Issued phase (self-heals a crash after the transition)", func() {
-			// Simulate a crash after transitionToIssued flipped the status but before the label was cleared:
-			// the node is in the Issued phase with the initialized label still set. reconcileIssued removes it,
-			// so the label can't be orphaned by the transition's non-atomic writes.
+			// Simulate a crash after status was updated but before the label was cleared.
 			node.Labels[v1.NodeInitializedLabelKey] = "true"
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
@@ -461,15 +459,15 @@ var _ = Describe("Reboot Lifecycle", func() {
 		})
 
 		It("retries the replacement delete when it fails, rather than stranding the node", func() {
-			env.Clock.Step(21 * time.Minute)                                              // past the observation window
-			nodeClaim.Finalizers = append(nodeClaim.Finalizers, "test.karpenter.sh/hold") // keep the deleting NodeClaim observable
+			env.Clock.Step(21 * time.Minute)
+			nodeClaim.Finalizers = append(nodeClaim.Finalizers, "test.karpenter.sh/hold")
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 
 			failingClient := &nodeClaimDeleteErrorClient{Client: env.Client, err: fmt.Errorf("injected delete failure")}
 			failing := reboot.NewController(env.Clock, failingClient, cloudProvider, terminator.NewTerminator(env.Clock, env.Client, queue, recorder), recorder)
 			_ = ExpectObjectReconcileFailed(ctx, env.Client, failing, nodeClaim)
 
-			// Nothing terminal was recorded, so the next reconcile re-enters the failure path and retries the delete.
+			// Failed delete leaves the reboot active so replacement can be retried.
 			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
 			Expect(nodeClaim.DeletionTimestamp.IsZero()).To(BeTrue())
 			Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).IsTrue()).To(BeTrue())
@@ -478,21 +476,21 @@ var _ = Describe("Reboot Lifecycle", func() {
 			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
 			expectReplaced(nodeClaim, "recovery_timeout")
 
-			// Once deleting, the NodeClaim belongs to termination: a further reconcile doesn't re-report the failure.
+			// Once deleting, termination owns the NodeClaim.
 			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
 			Expect(recorder.Calls(events.RebootFailed)).To(Equal(1))
 		})
 
 		It("fails when the node is gone and the deadline has elapsed", func() {
 			env.Clock.Step(21 * time.Minute)
-			ExpectApplied(ctx, env.Client, nodePool, nodeClaim) // node intentionally not applied
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim)
 			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
 
 			expectReplaced(nodeClaim, "recovery_timeout")
 		})
 
 		It("keeps polling when the node is gone but the deadline has not elapsed", func() {
-			ExpectApplied(ctx, env.Client, nodePool, nodeClaim) // node intentionally not applied
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim)
 			result := ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
 
 			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
