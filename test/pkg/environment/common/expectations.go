@@ -189,6 +189,59 @@ func (env *Environment) ExpectCreatedOrUpdated(objects ...client.Object) {
 	}
 }
 
+// ExpectRepairFaultInjected makes a node repair-eligible by injecting env.RepairCondition(), backdated past any
+// RepairPolicy toleration so repair can act on it immediately.
+func (env *Environment) ExpectRepairFaultInjected(node *corev1.Node) {
+	GinkgoHelper()
+	cond, ok := env.RepairCondition()
+	Expect(ok).To(BeTrue(), "no repair condition for this provider, pass --repair-condition")
+	n := env.GetNode(node.Name)
+	env.ExpectStatusUpdated(env.ReplaceNodeConditions(&n, corev1.NodeCondition{
+		Type:               cond.Type,
+		Status:             cond.Status,
+		LastTransitionTime: metav1.NewTime(time.Now().Add(-24 * time.Hour)),
+		Reason:             lo.CoalesceOrEmpty(cond.Reason, "E2ETest"),
+		Message:            "injected repair-eligible fault",
+	}))
+}
+
+// ExpectRepairFaultCleared removes the condition ExpectRepairFaultInjected injected, healing the node.
+func (env *Environment) ExpectRepairFaultCleared(node *corev1.Node) {
+	GinkgoHelper()
+	cond, ok := env.RepairCondition()
+	Expect(ok).To(BeTrue(), "no repair condition for this provider, pass --repair-condition")
+	n := env.GetNode(node.Name)
+	n.Status.Conditions = lo.Reject(n.Status.Conditions, func(c corev1.NodeCondition, _ int) bool { return c.Type == cond.Type })
+	env.ExpectStatusUpdated(&n)
+}
+
+// ExpectRebootFaultInjected makes repair reboot a node by injecting env.RebootCondition(). Unlike a repair fault, it's
+// backdated only 11 minutes: past a reboot policy's toleration, but before a longer-toleration replace policy on the
+// same condition is also eligible, since repair takes the most disruptive eligible action.
+func (env *Environment) ExpectRebootFaultInjected(node *corev1.Node) {
+	GinkgoHelper()
+	cond, ok := env.RebootCondition()
+	Expect(ok).To(BeTrue(), "no reboot condition for this provider, pass --reboot-condition")
+	n := env.GetNode(node.Name)
+	env.ExpectStatusUpdated(env.ReplaceNodeConditions(&n, corev1.NodeCondition{
+		Type:               cond.Type,
+		Status:             cond.Status,
+		LastTransitionTime: metav1.NewTime(time.Now().Add(-11 * time.Minute)),
+		Reason:             lo.CoalesceOrEmpty(cond.Reason, "E2ETest"),
+		Message:            "injected reboot-clearable fault",
+	}))
+}
+
+// ExpectRebootFaultCleared removes the condition ExpectRebootFaultInjected injected, as a reboot that cleared the fault would.
+func (env *Environment) ExpectRebootFaultCleared(node *corev1.Node) {
+	GinkgoHelper()
+	cond, ok := env.RebootCondition()
+	Expect(ok).To(BeTrue(), "no reboot condition for this provider, pass --reboot-condition")
+	n := env.GetNode(node.Name)
+	n.Status.Conditions = lo.Reject(n.Status.Conditions, func(c corev1.NodeCondition, _ int) bool { return c.Type == cond.Type })
+	env.ExpectStatusUpdated(&n)
+}
+
 func (env *Environment) ReplaceNodeConditions(node *corev1.Node, conds ...corev1.NodeCondition) *corev1.Node {
 	keys := sets.New[string](lo.Map(conds, func(c corev1.NodeCondition, _ int) string { return string(c.Type) })...)
 	node.Status.Conditions = lo.Reject(node.Status.Conditions, func(c corev1.NodeCondition, _ int) bool {
