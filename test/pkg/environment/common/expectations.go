@@ -195,14 +195,15 @@ func (env *Environment) ExpectRepairFaultInjected(node *corev1.Node) {
 	GinkgoHelper()
 	condType, condStatus, ok := env.RepairCondition()
 	Expect(ok).To(BeTrue(), "no repair condition for this provider, pass --repair-condition")
-	n := env.GetNode(node.Name)
-	env.ExpectStatusUpdated(env.ReplaceNodeConditions(&n, corev1.NodeCondition{
-		Type:               condType,
-		Status:             condStatus,
-		LastTransitionTime: metav1.NewTime(time.Now().Add(-24 * time.Hour)),
-		Reason:             "E2ETest",
-		Message:            "injected repair-eligible fault",
-	}))
+	env.expectNodeStatusPatched(node.Name, func(n *corev1.Node) {
+		env.ReplaceNodeConditions(n, corev1.NodeCondition{
+			Type:               condType,
+			Status:             condStatus,
+			LastTransitionTime: metav1.NewTime(time.Now().Add(-24 * time.Hour)),
+			Reason:             "E2ETest",
+			Message:            "injected repair-eligible fault",
+		})
+	})
 }
 
 // ExpectRepairFaultCleared removes the condition ExpectRepairFaultInjected injected, healing the node.
@@ -210,9 +211,22 @@ func (env *Environment) ExpectRepairFaultCleared(node *corev1.Node) {
 	GinkgoHelper()
 	condType, _, ok := env.RepairCondition()
 	Expect(ok).To(BeTrue(), "no repair condition for this provider, pass --repair-condition")
-	n := env.GetNode(node.Name)
-	n.Status.Conditions = lo.Reject(n.Status.Conditions, func(c corev1.NodeCondition, _ int) bool { return c.Type == condType })
-	env.ExpectStatusUpdated(&n)
+	env.expectNodeStatusPatched(node.Name, func(n *corev1.Node) {
+		n.Status.Conditions = lo.Reject(n.Status.Conditions, func(c corev1.NodeCondition, _ int) bool { return c.Type == condType })
+	})
+}
+
+// expectNodeStatusPatched applies mutate to the Node's status with an optimistically locked merge patch. A full status
+// update from a stale cached copy would also overwrite the Node's metadata, e.g. dropping a just-added annotation.
+func (env *Environment) expectNodeStatusPatched(name string, mutate func(*corev1.Node)) {
+	GinkgoHelper()
+	Eventually(func(g Gomega) {
+		n := &corev1.Node{}
+		g.Expect(env.Client.Get(env.Context, types.NamespacedName{Name: name}, n)).To(Succeed())
+		stored := n.DeepCopy()
+		mutate(n)
+		g.Expect(env.Client.Status().Patch(env.Context, n, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{}))).To(Succeed())
+	}).WithTimeout(10 * time.Second).Should(Succeed())
 }
 
 func (env *Environment) ReplaceNodeConditions(node *corev1.Node, conds ...corev1.NodeCondition) *corev1.Node {
