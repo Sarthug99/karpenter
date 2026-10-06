@@ -78,7 +78,7 @@ delete-kind-dra: ## Delete DRA Kind cluster
 
 JUNIT_REPORT := $(if $(ARTIFACT_DIR), --ginkgo.junit-report="$(ARTIFACT_DIR)/junit_report.xml")
 e2etests: ## Run the e2e suite against your local cluster
-	cd test && go test \
+	fails=0; for i in 1 2 3 4 5; do echo "=== VERIFY PASS $$i"; (cd test && go test \
 		-count 1 \
 		-timeout 2h \
 		-v \
@@ -88,7 +88,7 @@ e2etests: ## Run the e2e suite against your local cluster
 		--ginkgo.skip="${SKIP}" \
 		--ginkgo.timeout=2h \
 		--ginkgo.grace-period=15m \
-		--ginkgo.vv
+		--ginkgo.vv) || fails=$$((fails+1)); done; echo "=== VERIFY FAILED PASSES: $$fails/5"; test $$fails -eq 0
 
 # Run make install-kwok to install the kwok controller in your cluster first
 # Webhooks are currently not supported in the kwok provider.
