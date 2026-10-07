@@ -135,6 +135,16 @@ func (t *Terminator) Drain(ctx context.Context, node *corev1.Node, nodeGracePeri
 	return nil
 }
 
+// StopDrain removes the node's pods from the eviction queue.
+func (t *Terminator) StopDrain(ctx context.Context, node *corev1.Node) error {
+	pods, err := nodeutils.GetPods(ctx, t.kubeClient, node.Name)
+	if err != nil {
+		return fmt.Errorf("listing pods on node, %w", err)
+	}
+	t.evictionQueue.Remove(pods...)
+	return nil
+}
+
 func (t *Terminator) groupPodsByPriority(pods []*corev1.Pod) [][]*corev1.Pod {
 	// 1. Prioritize noncritical pods, non-daemon pods https://kubernetes.io/docs/concepts/cluster-administration/node-shutdown/
 	var nonCriticalNonDaemon, nonCriticalDaemon, criticalNonDaemon, criticalDaemon []*corev1.Pod

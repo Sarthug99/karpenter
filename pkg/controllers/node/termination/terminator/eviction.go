@@ -328,6 +328,15 @@ func (q *Queue) forceDelete(ctx context.Context, pod *corev1.Pod, nodeTerminatio
 	return reconcile.Result{}, nil
 }
 
+// Remove drops the pods from the queue, so neither eviction nor deletion is attempted for them.
+func (q *Queue) Remove(pods ...*corev1.Pod) {
+	q.Lock()
+	defer q.Unlock()
+	for _, pod := range pods {
+		delete(q.items, NewQueueKey(pod))
+	}
+}
+
 // complete removes the pod from the queue.
 func (q *Queue) complete(pod *corev1.Pod) {
 	q.Lock()
