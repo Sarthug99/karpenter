@@ -16,7 +16,7 @@ spec:
       values: ["True"]
   delay:
     durationMilliseconds: 600000
-    jitterDurationMilliseconds: 0
+    jitterDurationMilliseconds: 600000
   next:
     statusSubresource: status
     # This overrides KWOK's built-in node-heartbeat-with-lease stage (a locally-applied Stage of the same name wins over
