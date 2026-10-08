@@ -27,12 +27,14 @@ spec:
     # the KWOKUnhealthyCondition constant) on every heartbeat, preserving its pinned lastTransitionTime. Re-emitting each
     # fire is robust regardless of stage scheduling: a heartbeat already scheduled while the node was healthy would
     # otherwise wipe a freshly-injected fault on the next (~10 min) interval. When a test clears the condition, it is
-    # absent from status so nothing re-emits it and the node heals.
+    # absent from status so nothing re-emits it and the node heals. A kwok.x-k8s.io/stage=unhealthy node keeps Ready too.
     statusTemplate: |
       {{ $now := Now }}
       {{ $lastTransitionTime := or .metadata.creationTimestamp $now }}
+      {{ $unhealthy := eq (dig "metadata" "labels" "kwok.x-k8s.io/stage" "" .) "unhealthy" }}
       conditions:
       {{ range NodeConditions }}
+      {{ if not (and $unhealthy (eq .type "Ready")) }}
       - lastHeartbeatTime: {{ $now | Quote }}
         lastTransitionTime: {{ $lastTransitionTime | Quote }}
         message: {{ .message | Quote }}
@@ -40,8 +42,9 @@ spec:
         status: {{ .status | Quote }}
         type: {{ .type | Quote }}
       {{ end }}
+      {{ end }}
       {{ range .status.conditions }}
-      {{ if or (eq .type "KWOKUnhealthy") (eq .type "KWOKRebootRequired") }}
+      {{ if or (eq .type "KWOKUnhealthy") (eq .type "KWOKRebootRequired") (and $unhealthy (eq .type "Ready")) }}
       - lastHeartbeatTime: {{ $now | Quote }}
         lastTransitionTime: {{ .lastTransitionTime | Quote }}
         message: {{ .message | Quote }}
