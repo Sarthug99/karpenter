@@ -1234,6 +1234,19 @@ var _ = Describe("Repair", func() {
 			Expect(queue.GetCommands()).To(HaveLen(1))
 		})
 
+		It("should not measure the toleration from a failed reboot", func() {
+			registerNode(nodeClaim, node)
+			markUnhealthy(node, "BadNode")
+			env.Clock.Step(40 * time.Minute)
+			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+			nodeClaim.StatusConditions(status.WithClock(env.Clock)).SetFalse(v1.ConditionTypeRebooting, v1.RebootReasonFailed, "reboot request is invalid")
+			ExpectApplied(ctx, env.Client, nodeClaim)
+			ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(nodeClaim))
+
+			ExpectSingletonReconciled(ctx, repairController)
+			Expect(queue.GetCommands()).To(HaveLen(1))
+		})
+
 		It("should not repair a rebooting node", func() {
 			registerNode(nodeClaim, node)
 			markUnhealthy(node, "BadNode")

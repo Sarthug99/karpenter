@@ -232,15 +232,15 @@ func (in *StateNode) ShallowCopy() *StateNode {
 
 // GetRepairResult returns the repair decision for the Node at now, from the policy matches the Node informer keeps
 // current. An empty Action means no policy applies or none has waited out its toleration yet. Tolerations are measured
-// from no earlier than the end of the last reboot, since a node rejoins uninitialized after a successful reboot and its
-// conditions may not have caught up yet.
+// from no earlier than the end of the last successful reboot, since a node rejoins uninitialized after a successful
+// reboot and its conditions may not have caught up yet. A failed reboot never touched the node, so it sets no floor.
 func (in *StateNode) GetRepairResult(now time.Time) health.RepairResult {
 	if in.Node == nil {
 		return health.RepairResult{}
 	}
 	var rebootFinishedAt time.Time
 	if in.NodeClaim != nil {
-		if rebooting := in.NodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting); rebooting != nil && rebooting.IsFalse() {
+		if rebooting := in.NodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting); rebooting != nil && rebooting.IsFalse() && rebooting.Reason == v1.RebootReasonSucceeded {
 			rebootFinishedAt = rebooting.LastTransitionTime.Time
 		}
 	}
