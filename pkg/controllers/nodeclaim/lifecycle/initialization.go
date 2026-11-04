@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/awslabs/operatorpkg/status"
 	"github.com/samber/lo"
@@ -33,15 +34,18 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
+	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
 )
 
 type Initialization struct {
 	kubeClient client.Client
+	recorder   events.Recorder
 	clock      clock.Clock
 }
 
@@ -93,6 +97,14 @@ func (i *Initialization) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim)
 	} else if !ok {
 		nodeClaim.StatusConditions(status.WithClock(i.clock)).SetUnknownWithReason(v1.ConditionTypeInitialized, "DRADriverPoolsNotPublished", fmt.Sprintf("DRA driver %q has not published a complete resource pool", driver))
 		return reconcile.Result{}, nil
+	}
+	if pod, ok, err := i.rebootDepartingPodsGone(ctx, node, nodeClaim); err != nil {
+		return reconcile.Result{}, err
+	} else if !ok {
+		nodeClaim.StatusConditions(status.WithClock(i.clock)).SetUnknownWithReason(v1.ConditionTypeInitialized, events.RebootDepartingPodsTerminating, fmt.Sprintf("Pod %q deleted before the reboot is still terminating", client.ObjectKeyFromObject(pod)))
+		i.recorder.Publish(RebootDepartingPodsTerminatingEvent(nodeClaim, pod))
+		// A pod finishing termination changes neither the NodeClaim nor the Node, so poll.
+		return reconcile.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 	stored := node.DeepCopy()
 	node.Labels = lo.Assign(node.Labels, map[string]string{v1.NodeInitializedLabelKey: "true"})
@@ -275,4 +287,24 @@ func formatTaint(taint *corev1.Taint) string {
 		return fmt.Sprintf("%s:%s", taint.Key, taint.Effect)
 	}
 	return fmt.Sprintf("%s=%s:%s", taint.Key, taint.Value, taint.Effect)
+}
+
+// rebootDepartingPodsGone reports whether a rebooted node's pods have finished terminating, returning one that hasn't.
+// The reboot deletes every pod but its DaemonSet and mirror pods, and a kubelet that was down finishes terminating them
+// only after the node returns. Until then they still hold their resources (e.g. an allocated DRA claim), so the node is
+// modeled as returning rather than initialized. Like the other initialization checks this is unbounded: a pod stuck
+// terminating holds re-initialization until it's gone.
+func (i *Initialization) rebootDepartingPodsGone(ctx context.Context, node *corev1.Node, nodeClaim *v1.NodeClaim) (*corev1.Pod, bool, error) {
+	cond := nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting)
+	if cond == nil || !cond.IsFalse() || cond.Reason != v1.RebootReasonSucceeded {
+		return nil, true, nil
+	}
+	pods, err := nodeutils.GetPods(ctx, i.kubeClient, node.Name)
+	if err != nil {
+		return nil, false, fmt.Errorf("listing pods on node, %w", err)
+	}
+	if pod, ok := lo.Find(pods, func(p *corev1.Pod) bool { return podutils.IsTerminating(p) && !podutils.IsTerminal(p) }); ok {
+		return pod, false, nil
+	}
+	return nil, true, nil
 }

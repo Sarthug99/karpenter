@@ -68,12 +68,14 @@ Two outcomes:
 - **Destroy and recreate:** if kubelet gets the shutdown notification with `sgp > 0`, pods are terminated and recreated by their controllers.
 - **Survive:** otherwise kubelet writes no terminal status; pods stay bound and if the node returns before eviction, containers restart in place.
 
+Karpenter doesn't rely on either: before issuing the reboot it gracefully deletes every pod still on the node except DaemonSet and mirror pods, so no workload pod survives. A pod that restarts in place does so against node-local state the reboot invalidated. For example, a DRA claim stays prepared in kubelet's and the driver's checkpoints while its CDI spec, on tmpfs, is gone, so the container never starts. Graceful node shutdown would avoid that, but it's optional and needs a live kubelet. A terminating pod is safe either way: kubelet finishes terminating it and releases its resources before or after the reboot. DaemonSet pods stay because their replacements could only come back to this node. **Limitation:** DaemonSets with resource claims or volumes aren't supported across a reboot; their pods ride it against the stale node-local state. Startup taints aren't re-applied after a reboot either, so pods that depend on a DaemonSet's node setup can schedule before it finishes.
+
 ### Customer-POV tradeoffs:
 
 - On the **destroy** branch, a reboot disrupts workloads much like a replace. Reboot's value here lies in preserving the instance, its local data, and clearing the fault that triggered the reboot.
 - On the **survive** branch, pod status remains stale as `Running` while the node is down, creating an observability gap for operators.
 - Reboots exceeding the default 300s `NoExecute` toleration may trigger pod eviction, so in-place survival is best-effort, not guaranteed.
-- A bounded drain may leave residual pods on the node. Karpenter does not force-delete them or introduce a reboot-specific eviction mechanism; after the reboot is issued, existing kubelet and Kubernetes node-failure semantics determine whether they restart in place or are eventually evicted.
+- A bounded drain may leave residual pods on the node. Once the deadline passes, Karpenter deletes them gracefully (never force-deletes) before issuing the reboot, as termination does at its grace period.
 
 ### Why reboot needs provisioning suppression
 
@@ -191,7 +193,7 @@ node.Status.NodeInfo.BootID != preBootID
 
 the reboot taint is removed, independently of Node readiness. If reboot reaches a terminal failure without observing a changed `bootID`, the executor removes the reboot-owned taint as part of terminal cleanup.
 
-**Draining reuses termination’s existing** `Terminator.Drain`**.** The phase remains `RebootRequested` until drain completes. For `drainGracePeriod > 0`, the executor drains with `deadline = drainStart + drainGracePeriod`, honoring PDBs and pod grace up to the deadline; residual pods ride the reboot. For `0`, drain is skipped and reboot is issued immediately. DaemonSet pods are not drained: their replacements could only schedule back to the same Node, where they would compete with other pods for its capacity once it returns. **Karpenter does not inspect or branch on kubelet shutdown configuration.** After the reboot is issued, workload fate is governed by kubelet graceful-node-shutdown behavior and normal Kubernetes node-failure handling.
+**Draining reuses termination’s existing** `Terminator.Drain`**.** The phase remains `RebootRequested` until drain completes. For `drainGracePeriod > 0`, the executor drains with `deadline = drainStart + drainGracePeriod`, honoring PDBs and pod grace up to the deadline. For `0`, drain is skipped. Either way, before issuing the reboot the executor gracefully deletes every pod still on the Node (residual pods, and pods the drain skips because they tolerate `karpenter.sh/disrupted`), so none ride the reboot. DaemonSet and mirror pods are neither drained nor deleted: their replacements could only schedule back to the same Node, where they would compete with other pods for its capacity once it returns. **Karpenter does not inspect or branch on kubelet shutdown configuration.**
 
 #### Issuing
 
@@ -248,7 +250,9 @@ status:
 
 Reboot success means the machine restarted and kubelet successfully rejoined; it does not mean every Node-level resource or initialization dependency has completed.
 
-After `Rebooting` becomes terminal, the existing initialization controller revalidates its normal initialization requirements. Once those predicates are satisfied, it restores the initialized Node label and transitions the NodeClaim back to `Initialized=True`.
+After `Rebooting` becomes terminal, the existing initialization controller revalidates its normal initialization requirements. Once those predicates are satisfied, it restores the initialized Node label and transitions the NodeClaim back to `Initialized=True`. A rebooted node also waits for the pods its reboot deleted to finish terminating: if kubelet was down, it finishes them only after the node returns, and until then they still hold their resources (e.g. an allocated DRA claim). Until the node re-initializes it's modeled as returning, so their replacements wait for it instead of launching new capacity.
+
+**Warning:** like the other initialization checks, this wait is unbounded. A pod that never finishes terminating (e.g. a finalizer nobody removes, or a DRA or CSI driver that never comes back to release it) holds the node uninitialized, and its replacements pending, until it's gone. While it waits, the NodeClaim's `Initialized` condition carries reason `RebootDepartingPodsTerminating`, and a `RebootDepartingPodsTerminating` warning event names the pod. A timeout on initialization and re-initialization is future work.
 
 If the observation window expires before the recovery predicate is satisfied:
 
@@ -344,9 +348,9 @@ karpenter_node_reboot_duration_seconds{condition="AcceleratedHardwareReady"}
 - **Reboot causes workload disruption.** On the destroy path, pods are terminated and may bind to existing capacity elsewhere; they are not guaranteed to return to the rebooting node.
 
   **Mitigation:** reboot is disruption-budgeted, and provisioning suppression avoids launching unnecessary replacement capacity while the node is expected to return.
-- **Residual pods may remain bound and unavailable.** After the bounded drain expires, reboot proceeds with any residual pods still bound to the node. On the survive path, Pod status may remain stale as `Running` while the node is unavailable; sufficiently slow reboots may also trigger normal `NotReady`/`Unreachable` `NoExecute` eviction. In-place survival is therefore best-effort, not guaranteed.
+- **Residual pods are deleted, overriding PDBs at the deadline.** After the bounded drain expires, or immediately for a forceful reboot, Karpenter gracefully deletes the pods still on the node, including pods that tolerate `karpenter.sh/disrupted`, before issuing the reboot.
 
-  **Mitigation:** expose reboot as a first-class `Rebooting` NodeClaim condition, with Events and metrics, rather than relying on Pod status to communicate availability. Karpenter does not force-delete residual pods or introduce a reboot-specific eviction policy; workload-defined tolerations remain authoritative.
+  **Mitigation:** this matches node termination's grace-period semantics. Pods are deleted gracefully, never forced, so a live kubelet stops their containers before they're gone and a dead one finishes after the reboot. Pods that need state across a reboot should keep it in a persistent volume, not on the node.
 - **Post-reboot initialization may lag reboot success.** A Node can become `Ready=True` before extended resources, DRA resources, or other Karpenter initialization requirements are restored.
 
   **Mitigation:** reset `Initialized` to `Unknown` after the provider accepts the reboot and allow the existing initialization controller to revalidate the Node independently. `RebootSucceeded` means that the machine restarted and kubelet rejoined.

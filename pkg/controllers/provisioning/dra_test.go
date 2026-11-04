@@ -1766,4 +1766,179 @@ var _ = Describe("Dynamic Resource Allocation", func() {
 			Entry("set b first", true),
 		)
 	})
+	Context("Rebooting nodes (RB)", func() {
+		nodeResources := corev1.ResourceList{
+			corev1.ResourceCPU: resource.MustParse("4"), corev1.ResourceMemory: resource.MustParse("4Gi"), corev1.ResourcePods: resource.MustParse("10"),
+		}
+		// rebootingNode creates a gpu-it node whose NodeClaim is Rebooting=True; once issued, the node is uninitialized.
+		rebootingNode := func(issued bool) *corev1.Node {
+			GinkgoHelper()
+			nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+					v1.NodePoolLabelKey:            nodePool.Name,
+					corev1.LabelInstanceTypeStable: "gpu-it",
+				}},
+				Status: v1.NodeClaimStatus{Capacity: nodeResources, Allocatable: nodeResources},
+			})
+			node.Labels[corev1.LabelHostname] = node.Name
+			ExpectApplied(ctx, env.Client, nodeClaim, node)
+			ExpectMakeNodeClaimsInitialized(ctx, env.Client, env.Clock, nodeClaim)
+			ExpectMakeNodesInitialized(ctx, env.Client, env.Clock, node)
+			ExpectRebooting(ctx, env.Client, env.Clock, lo.Ternary(issued, v1.RebootReasonIssued, v1.RebootReasonRequested), nodeClaim, node)
+			cluster.UpdateNodeClaim(ExpectExists(ctx, env.Client, nodeClaim))
+			ExpectReconcileSucceeded(ctx, nodeController, client.ObjectKeyFromObject(node))
+			return ExpectExists(ctx, env.Client, node)
+		}
+		// boundPod binds a pod to the node, optionally marks it terminating, and records it in cluster state.
+		boundPod := func(name string, node *corev1.Node, terminating bool) *corev1.Pod {
+			GinkgoHelper()
+			pod := test.Pod(test.PodOptions{ObjectMeta: metav1.ObjectMeta{Name: name}})
+			ExpectApplied(ctx, env.Client, pod)
+			ExpectManualBinding(ctx, env.Client, pod, node)
+			if terminating {
+				ExpectDeletionTimestampSet(ctx, env.Client, pod)
+			}
+			pod = ExpectExists(ctx, env.Client, pod)
+			Expect(cluster.UpdatePod(ctx, pod)).To(Succeed())
+			return pod
+		}
+
+		BeforeEach(func() {
+			cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{gpuInstanceType("gpu-it", 1)}
+			ExpectApplied(ctx, env.Client, nodePool, test.DeviceClassWithSelector("gpu", gpuDriver))
+		})
+
+		It("should reuse a device held only by a pod leaving a rebooting node for a pod on that node (RB1)", func() {
+			node := rebootingNode(false)
+			slice := nodeLocalSlice(node, gpuDriver, "gpu-0")
+			ExpectApplied(ctx, env.Client, slice)
+			departing := boundPod("departing", node, true)
+			ExpectApplied(ctx, env.Client, allocatedClusterWideClaim("old-claim", slice.Spec.Pool.Name, gpuDriver, "gpu-0", podConsumer(departing)))
+
+			ExpectApplied(ctx, env.Client, test.ResourceClaimForRequests("new-claim", test.ExactDeviceRequest("req", "gpu", 1)))
+			pod := draPod("gpu", "new-claim")
+			provisionDRA(pod)
+
+			Expect(ExpectScheduled(ctx, env.Client, pod).Name).To(Equal(node.Name))
+			Expect(cloudProvider.CreateCalls).To(BeEmpty())
+		})
+		It("should not free a device held by a pod leaving a rebooting node for placement on another node (RB2)", func() {
+			// The only GPU is cluster-wide; the pending pod can't fit on the rebooting node, so a new NodeClaim would need it.
+			cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{
+				gpuInstanceType("gpu-it", 0),
+				fake.NewInstanceType("big-it", fake.WithResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("16")})),
+			}
+			ExpectApplied(ctx, env.Client, clusterWideSlice("shared-gpu-pool", gpuDriver, "shared-gpu-0"))
+			node := rebootingNode(false)
+			departing := boundPod("departing", node, true)
+			ExpectApplied(ctx, env.Client, allocatedClusterWideClaim("old-claim", "shared-gpu-pool", gpuDriver, "shared-gpu-0", podConsumer(departing)))
+
+			ExpectApplied(ctx, env.Client, test.ResourceClaimForRequests("new-claim", test.ExactDeviceRequest("req", "gpu", 1)))
+			pod := draPod("gpu", "new-claim")
+			pod.Spec.Containers[0].Resources.Requests = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("8")}
+			provisionDRA(pod)
+
+			ExpectNotScheduled(ctx, env.Client, pod)
+			Expect(cloudProvider.CreateCalls).To(BeEmpty())
+		})
+		It("should model a rebooting node with fresh devices, ignoring a pod the reboot will delete (RB3)", func() {
+			node := rebootingNode(false)
+			slice := nodeLocalSlice(node, gpuDriver, "gpu-0")
+			ExpectApplied(ctx, env.Client, slice)
+			riding := boundPod("riding", node, false)
+			ExpectApplied(ctx, env.Client, allocatedClusterWideClaim("old-claim", slice.Spec.Pool.Name, gpuDriver, "gpu-0", podConsumer(riding)))
+
+			ExpectApplied(ctx, env.Client, test.ResourceClaimForRequests("new-claim", test.ExactDeviceRequest("req", "gpu", 1)))
+			pod := draPod("gpu", "new-claim")
+			provisionDRA(pod)
+
+			Expect(ExpectScheduled(ctx, env.Client, pod).Name).To(Equal(node.Name))
+			Expect(cloudProvider.CreateCalls).To(BeEmpty())
+		})
+		It("should model a rebooting node with fresh devices after the reboot is issued (RB4)", func() {
+			node := rebootingNode(true)
+			slice := nodeLocalSlice(node, gpuDriver, "gpu-0")
+			ExpectApplied(ctx, env.Client, slice)
+			riding := boundPod("riding", node, false)
+			ExpectApplied(ctx, env.Client, allocatedClusterWideClaim("old-claim", slice.Spec.Pool.Name, gpuDriver, "gpu-0", podConsumer(riding)))
+
+			ExpectApplied(ctx, env.Client, test.ResourceClaimForRequests("new-claim", test.ExactDeviceRequest("req", "gpu", 1)))
+			pod := draPod("gpu", "new-claim")
+			provisionDRA(pod)
+
+			Expect(ExpectScheduled(ctx, env.Client, pod).Name).To(Equal(node.Name))
+			Expect(cloudProvider.CreateCalls).To(BeEmpty())
+		})
+		It("should reuse a device held only by a pod leaving a rebooting node after the reboot is issued (RB5)", func() {
+			node := rebootingNode(true)
+			slice := nodeLocalSlice(node, gpuDriver, "gpu-0")
+			ExpectApplied(ctx, env.Client, slice)
+			departing := boundPod("departing", node, true)
+			ExpectApplied(ctx, env.Client, allocatedClusterWideClaim("old-claim", slice.Spec.Pool.Name, gpuDriver, "gpu-0", podConsumer(departing)))
+
+			ExpectApplied(ctx, env.Client, test.ResourceClaimForRequests("new-claim", test.ExactDeviceRequest("req", "gpu", 1)))
+			pod := draPod("gpu", "new-claim")
+			provisionDRA(pod)
+
+			Expect(ExpectScheduled(ctx, env.Client, pod).Name).To(Equal(node.Name))
+			Expect(cloudProvider.CreateCalls).To(BeEmpty())
+		})
+		It("should model a rebooting node with fresh devices after kubelet wipes its slices (RB7)", func() {
+			node := rebootingNode(true)
+			riding := boundPod("riding", node, false)
+			ExpectApplied(ctx, env.Client, allocatedClusterWideClaim("old-claim", node.Name, gpuDriver, "gpu-0", podConsumer(riding)))
+
+			ExpectApplied(ctx, env.Client, test.ResourceClaimForRequests("new-claim", test.ExactDeviceRequest("req", "gpu", 1)))
+			pod := draPod("gpu", "new-claim")
+			provisionDRA(pod)
+
+			Expect(ExpectScheduled(ctx, env.Client, pod).Name).To(Equal(node.Name))
+			Expect(cloudProvider.CreateCalls).To(BeEmpty())
+		})
+		// rebootedNode is a node whose reboot succeeded but hasn't re-initialized: Rebooting=False/RebootSucceeded, uninitialized.
+		rebootedNode := func() *corev1.Node {
+			GinkgoHelper()
+			node := rebootingNode(true)
+			nodeClaim := lo.Must(lo.Find(ExpectNodeClaims(ctx, env.Client), func(nc *v1.NodeClaim) bool { return nc.Status.ProviderID == node.Spec.ProviderID }))
+			ExpectRebootSucceeded(ctx, env.Client, env.Clock, nodeClaim, node)
+			cluster.UpdateNodeClaim(ExpectExists(ctx, env.Client, nodeClaim))
+			ExpectReconcileSucceeded(ctx, nodeController, client.ObjectKeyFromObject(node))
+			return ExpectExists(ctx, env.Client, node)
+		}
+		It("should keep modeling a rebooted node with fresh devices until it re-initializes (RB8)", func() {
+			node := rebootedNode()
+			riding := boundPod("riding", node, false)
+			ExpectApplied(ctx, env.Client, allocatedClusterWideClaim("old-claim", node.Name, gpuDriver, "gpu-0", podConsumer(riding)))
+
+			ExpectApplied(ctx, env.Client, test.ResourceClaimForRequests("new-claim", test.ExactDeviceRequest("req", "gpu", 1)))
+			pod := draPod("gpu", "new-claim")
+			provisionDRA(pod)
+
+			Expect(ExpectScheduled(ctx, env.Client, pod).Name).To(Equal(node.Name))
+			Expect(cloudProvider.CreateCalls).To(BeEmpty())
+		})
+		It("should reuse a device held only by a pod that left a reboot before the node re-initializes (RB9)", func() {
+			node := rebootedNode()
+			departing := boundPod("departing", node, true)
+			ExpectApplied(ctx, env.Client, allocatedClusterWideClaim("old-claim", node.Name, gpuDriver, "gpu-0", podConsumer(departing)))
+
+			ExpectApplied(ctx, env.Client, test.ResourceClaimForRequests("new-claim", test.ExactDeviceRequest("req", "gpu", 1)))
+			pod := draPod("gpu", "new-claim")
+			provisionDRA(pod)
+
+			Expect(ExpectScheduled(ctx, env.Client, pod).Name).To(Equal(node.Name))
+			Expect(cloudProvider.CreateCalls).To(BeEmpty())
+		})
+		It("should fall back to template devices for a rebooting node with no published slices (RB6)", func() {
+			node := rebootingNode(true)
+
+			ExpectApplied(ctx, env.Client, test.ResourceClaimForRequests("new-claim", test.ExactDeviceRequest("req", "gpu", 1)))
+			pod := draPod("gpu", "new-claim")
+			provisionDRA(pod)
+
+			Expect(ExpectScheduled(ctx, env.Client, pod).Name).To(Equal(node.Name))
+			Expect(cloudProvider.CreateCalls).To(BeEmpty())
+		})
+	})
+
 })

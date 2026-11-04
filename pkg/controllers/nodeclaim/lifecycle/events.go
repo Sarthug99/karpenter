@@ -61,6 +61,16 @@ func NodeClassNotReadyEvent(nodeClaim *v1.NodeClaim, err error) events.Event {
 	}
 }
 
+func RebootDepartingPodsTerminatingEvent(nodeClaim *v1.NodeClaim, pod *corev1.Pod) events.Event {
+	return events.Event{
+		InvolvedObject: nodeClaim,
+		Type:           corev1.EventTypeWarning,
+		Reason:         events.RebootDepartingPodsTerminating,
+		Message:        fmt.Sprintf("Waiting to re-initialize after reboot until pod %s/%s, deleted before the reboot, finishes terminating", pod.Namespace, pod.Name),
+		DedupeValues:   []string{string(nodeClaim.UID), string(pod.UID)},
+	}
+}
+
 func UnregisteredTaintMissingEvent(nodeClaim *v1.NodeClaim) events.Event {
 	return events.Event{
 		InvolvedObject: nodeClaim,

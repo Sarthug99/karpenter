@@ -31,8 +31,10 @@ import (
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
 	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -51,6 +53,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
+	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
 )
 
 const (
@@ -181,6 +184,9 @@ func (c *Controller) reconcileRequested(ctx context.Context, nodeClaim *v1.NodeC
 		if done, res, err := c.drain(ctx, nodeClaim, node, tgp); err != nil || !done {
 			return res, err
 		}
+		if err := c.deleteRidingPods(ctx, node); err != nil {
+			return reconcile.Result{}, err
+		}
 		// Record pre-boot state before the first provider call.
 		if err := c.recordIssuingState(ctx, nodeClaim, node); err != nil {
 			return reconcile.Result{}, err
@@ -232,12 +238,12 @@ func (c *Controller) reconcileIssued(ctx context.Context, nodeClaim *v1.NodeClai
 	return reconcile.Result{RequeueAfter: pollInterval}, nil
 }
 
-// drain evicts pods before reboot, with residual pods allowed to ride the reboot post deadline.
+// drain evicts pods before reboot, leaving any it can't evict by the deadline to deleteRidingPods.
 // DaemonSet pods stay on the node: their replacements could only schedule back to it, where they'd compete with
 // other pods for its capacity once it returns.
 // A drained reboot observes at least minDrainTime to catch late pod bindings.
 func (c *Controller) drain(ctx context.Context, nodeClaim *v1.NodeClaim, node *corev1.Node, tgp *time.Duration) (done bool, res reconcile.Result, err error) {
-	// A forceful reboot skips the drain, so every pod rides the reboot.
+	// A forceful reboot skips the drain.
 	if tgp != nil && *tgp == 0 {
 		return true, reconcile.Result{}, nil
 	}
@@ -247,7 +253,7 @@ func (c *Controller) drain(ctx context.Context, nodeClaim *v1.NodeClaim, node *c
 	if tgp != nil {
 		deadline = new(rebootRequestedAt(nodeClaim).Add(max(*tgp, minDrainTime)))
 	}
-	// Residual pods are never deleted; they ride the reboot once the deadline passes.
+	// Residual pods aren't force-deleted here; deleteRidingPods deletes them gracefully once the deadline passes.
 	if err := c.terminator.Drain(ctx, node, deadline, terminator.LeaveResidualPods(), terminator.SkipDaemonSets()); err != nil {
 		if !terminator.IsNodeDrainError(err) {
 			return false, reconcile.Result{}, fmt.Errorf("draining node, %w", err)
@@ -259,13 +265,37 @@ func (c *Controller) drain(ctx context.Context, nodeClaim *v1.NodeClaim, node *c
 		if remaining := deadline.Sub(c.clock.Now()); remaining > 0 {
 			return false, reconcile.Result{RequeueAfter: min(pollInterval, remaining)}, nil
 		}
-		return true, reconcile.Result{}, nil // deadline elapsed (always at or past the floor): residual pods ride the reboot
+		return true, reconcile.Result{}, nil // deadline elapsed (always at or past the floor)
 	}
 	// Hold through the minimum drain window to catch late bindings.
 	if remaining := floor.Sub(c.clock.Now()); remaining > 0 {
 		return false, reconcile.Result{RequeueAfter: remaining}, nil
 	}
 	return true, reconcile.Result{}, nil
+}
+
+// deleteRidingPods gracefully deletes every pod that would otherwise ride the reboot. A pod that rides restarts in
+// place against node-local state the reboot invalidated (e.g. a DRA claim's CDI spec lives on tmpfs while kubelet's and
+// the driver's checkpoints say it's prepared), and nothing on the node reliably terminates it first: kubelet graceful
+// shutdown is optional and needs a live kubelet. A terminating pod is safe: kubelet finishes terminating it, and
+// releases its resources, before or after the reboot. Graceful, not forced, so a live kubelet still stops the containers
+// before the pod is gone. DaemonSet and mirror pods stay; their replacements could only come back to this node.
+func (c *Controller) deleteRidingPods(ctx context.Context, node *corev1.Node) error {
+	pods, err := nodeutils.GetPods(ctx, c.kubeClient, node.Name)
+	if err != nil {
+		return fmt.Errorf("listing pods on node, %w", err)
+	}
+	for _, pod := range pods {
+		if podutils.IsTerminal(pod) || podutils.IsTerminating(pod) || podutils.IsOwnedByDaemonSet(pod) || podutils.IsOwnedByNode(pod) {
+			continue
+		}
+		// The UID precondition keeps a recreated pod with the same name from being deleted.
+		if err := c.kubeClient.Delete(ctx, pod, client.Preconditions{UID: lo.ToPtr(pod.UID)}); err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
+			return fmt.Errorf("deleting pod %s/%s before reboot, %w", pod.Namespace, pod.Name, err)
+		}
+		log.FromContext(ctx).WithValues("Pod", klog.KObj(pod)).V(1).Info("deleted pod before reboot")
+	}
+	return nil
 }
 
 // recordIssuingState persists the pre-reboot bootID before the first provider call.

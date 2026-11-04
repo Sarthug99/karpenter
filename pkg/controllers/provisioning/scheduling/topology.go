@@ -166,7 +166,7 @@ func (t *Topology) Update(ctx context.Context, p *corev1.Pod) error {
 
 	if (t.preferencePolicy == PreferencePolicyIgnore && pod.HasRequiredPodAntiAffinity(p)) ||
 		(t.preferencePolicy == PreferencePolicyRespect && pod.HasPodAntiAffinity(p)) {
-		if err := t.updateInverseAntiAffinity(ctx, p, nil); err != nil {
+		if err := t.updateInverseAntiAffinity(ctx, p, nil, false); err != nil {
 			return fmt.Errorf("updating inverse anti-affinities, %w", err)
 		}
 	}
@@ -312,12 +312,17 @@ func (t *Topology) Unregister(topologyKey string, domain string) {
 // have to look at every pod in the cluster as there is no way to query for a pod with anti-affinity terms.
 func (t *Topology) updateInverseAffinities(ctx context.Context) error {
 	var errs error
+	// Pods departing a returning node don't hold its hostname domain; it comes back without them.
+	departing := sets.New[types.NamespacedName]()
+	for _, n := range t.stateNodes {
+		departing.Insert(n.RebootDepartingPods()...)
+	}
 	t.cluster.ForPodsWithAntiAffinity(func(pod *corev1.Pod, node *corev1.Node) bool {
 		// don't count the pod we are excluding
 		if t.excludedPods.Has(string(pod.UID)) {
 			return true
 		}
-		if err := t.updateInverseAntiAffinity(ctx, pod, node.Labels); err != nil {
+		if err := t.updateInverseAntiAffinity(ctx, pod, node.Labels, departing.Has(client.ObjectKeyFromObject(pod))); err != nil {
 			errs = multierr.Append(errs, fmt.Errorf("tracking existing pod anti-affinity, %w", err))
 		}
 		return true
@@ -327,12 +332,16 @@ func (t *Topology) updateInverseAffinities(ctx context.Context) error {
 
 // updateInverseAntiAffinity is used to track topologies of inverse anti-affinities. Here the domains & counts track the
 // pods with the anti-affinity.
-func (t *Topology) updateInverseAntiAffinity(ctx context.Context, pod *corev1.Pod, domains map[string]string) error {
+func (t *Topology) updateInverseAntiAffinity(ctx context.Context, pod *corev1.Pod, domains map[string]string, departing bool) error {
 	// We intentionally don't track inverse anti-affinity preferences. We're not
 	// required to enforce them so it just adds complexity for very little
 	// value.  The problem with them comes from the relaxation process, the pod
 	// we are relaxing is not the pod with the anti-affinity term.
 	for _, term := range pod.Spec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution {
+		// The pod's hostname domain is a returning node that comes back without it; its wider domains still hold it.
+		if departing && term.TopologyKey == corev1.LabelHostname {
+			continue
+		}
 		namespaces, err := t.buildNamespaceList(ctx, pod.Namespace, term.Namespaces, term.NamespaceSelector)
 		if err != nil {
 			return err

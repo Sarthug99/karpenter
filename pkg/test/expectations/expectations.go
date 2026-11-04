@@ -769,6 +769,37 @@ func ExpectMakeNodeClaimsInitialized(ctx context.Context, c client.Client, clk c
 	}
 }
 
+// ExpectRebooting puts a node where the reboot controller does for the given Rebooting reason: Rebooting=True with the
+// scheduling fence on the Node, and from RebootIssued on, initialization reset. nodeClaim and node are updated in place.
+func ExpectRebooting(ctx context.Context, c client.Client, clk clock.Clock, reason string, nodeClaim *v1.NodeClaim, node *corev1.Node) {
+	GinkgoHelper()
+	Expect(c.Get(ctx, client.ObjectKeyFromObject(nodeClaim), nodeClaim)).To(Succeed())
+	Expect(c.Get(ctx, client.ObjectKeyFromObject(node), node)).To(Succeed())
+	nodeClaim.StatusConditions(status.WithClock(clk)).SetTrueWithReason(v1.ConditionTypeRebooting, reason, "rebooting")
+	if !lo.ContainsBy(node.Spec.Taints, func(t corev1.Taint) bool { return t.MatchTaint(&v1.RebootingNoScheduleTaint) }) {
+		node.Spec.Taints = append(node.Spec.Taints, v1.RebootingNoScheduleTaint)
+	}
+	if reason == v1.RebootReasonIssued {
+		nodeClaim.StatusConditions(status.WithClock(clk)).SetUnknownWithReason(v1.ConditionTypeInitialized, v1.RebootReasonRebooting, "node is rebooting")
+		delete(node.Labels, v1.NodeInitializedLabelKey)
+	}
+	ExpectApplied(ctx, c, nodeClaim, node)
+}
+
+// ExpectRebootSucceeded puts a node where the reboot controller leaves it on success: Rebooting=False/RebootSucceeded
+// with the scheduling fence removed, still uninitialized until initialization re-runs. nodeClaim and node are updated
+// in place.
+func ExpectRebootSucceeded(ctx context.Context, c client.Client, clk clock.Clock, nodeClaim *v1.NodeClaim, node *corev1.Node) {
+	GinkgoHelper()
+	Expect(c.Get(ctx, client.ObjectKeyFromObject(nodeClaim), nodeClaim)).To(Succeed())
+	Expect(c.Get(ctx, client.ObjectKeyFromObject(node), node)).To(Succeed())
+	nodeClaim.StatusConditions(status.WithClock(clk)).SetFalse(v1.ConditionTypeRebooting, v1.RebootReasonSucceeded, "node rebooted and rejoined the cluster")
+	nodeClaim.StatusConditions(status.WithClock(clk)).SetUnknownWithReason(v1.ConditionTypeInitialized, v1.RebootReasonRebooting, "node is rebooting")
+	node.Spec.Taints = lo.Reject(node.Spec.Taints, func(t corev1.Taint, _ int) bool { return t.MatchTaint(&v1.RebootingNoScheduleTaint) })
+	delete(node.Labels, v1.NodeInitializedLabelKey)
+	ExpectApplied(ctx, c, nodeClaim, node)
+}
+
 func ExpectMakeNodesInitialized(ctx context.Context, c client.Client, clk clock.Clock, nodes ...*corev1.Node) {
 	GinkgoHelper()
 	ExpectMakeNodesReady(ctx, c, clk, nodes...)
