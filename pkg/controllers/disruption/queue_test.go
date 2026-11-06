@@ -206,6 +206,37 @@ var _ = Describe("Queue", func() {
 			node1 = ExpectNodeExists(ctx, env.Client, node1.Name)
 			Expect(node1.Spec.Taints).ToNot(ContainElement(v1.DisruptedNoScheduleTaint))
 		})
+		It("should fail a command and untaint its candidate as soon as a replacement starts deleting", func() {
+			ExpectApplied(ctx, env.Client, nodeClaim1, node1, nodePool)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node1}, []*v1.NodeClaim{nodeClaim1})
+			stateNode := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim1)
+
+			nct := scheduling.NewNodeClaimTemplate(nodePool)
+			nct.InstanceTypeOptions = append([]*cloudprovider.InstanceType{}, cloudProvider.InstanceTypes...)
+			cmd := &disruption.Command{
+				Method:            disruption.NewDrift(env.Client, cluster, prov, recorder, env.Clock),
+				CreationTimestamp: env.Clock.Now(),
+				ID:                uuid.New(),
+				Results:           scheduling.Results{},
+				Candidates:        []*disruption.Candidate{{StateNode: stateNode, NodePool: nodePool}},
+				Replacements:      []*disruption.Replacement{{NodeClaim: &scheduling.NodeClaim{NodeClaimTemplate: *nct}}},
+			}
+			Expect(queue.StartCommand(ctx, cmd)).To(BeNil())
+			Expect(ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim1).MarkedForDeletion()).To(BeTrue())
+
+			replacement := &v1.NodeClaim{}
+			Expect(env.Client.Get(ctx, types.NamespacedName{Name: cmd.Replacements[0].Name}, replacement)).To(Succeed())
+			replacement.Finalizers = append(replacement.Finalizers, v1.TerminationFinalizer)
+			ExpectApplied(ctx, env.Client, replacement)
+			Expect(env.Client.Delete(ctx, replacement)).To(Succeed())
+
+			ExpectObjectReconciled(ctx, env.Client, queue, stateNode.NodeClaim)
+			Expect(queue.HasAny(stateNode.ProviderID())).To(BeFalse())
+			Expect(ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim1).MarkedForDeletion()).To(BeFalse())
+			node1 = ExpectNodeExists(ctx, env.Client, node1.Name)
+			Expect(node1.Spec.Taints).ToNot(ContainElement(v1.DisruptedNoScheduleTaint))
+			ExpectFinalizersRemoved(ctx, env.Client, replacement)
+		})
 		It("should emit the consolidation type in the failures metric when a command fails", func() {
 			ExpectApplied(ctx, env.Client, nodeClaim1, node1, nodePool)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node1}, []*v1.NodeClaim{nodeClaim1})

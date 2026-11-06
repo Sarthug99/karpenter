@@ -81,6 +81,17 @@ type NodeClaimSpec struct {
 	// +kubebuilder:validation:Schemaless
 	// +optional
 	ExpireAfter NillableDuration `json:"expireAfter,omitempty"`
+	// InitializationTimeout is the duration the controller will wait for a registered node to become initialized
+	// before deleting the NodeClaim and replacing it, measured from when the current boot began initializing.
+	// A node is initialized once it is Ready, its startup taints are removed, its requested resources are registered,
+	// and its expected DRA drivers have published resource pools. If left undefined, the controller will wait
+	// indefinitely.
+	// +kubebuilder:validation:Pattern=`^(([0-9]+(s|m|h))+|Never)$`
+	// +kubebuilder:validation:XValidation:rule="self == 'Never' || duration(self) >= duration('1m')",message="initializationTimeout must be at least 1m"
+	// +kubebuilder:validation:Type="string"
+	// +kubebuilder:validation:Schemaless
+	// +optional
+	InitializationTimeout NillableDuration `json:"initializationTimeout,omitempty" hash:"ignore"`
 }
 
 const (

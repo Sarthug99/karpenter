@@ -21,6 +21,7 @@ import (
 
 	"github.com/awslabs/operatorpkg/object"
 	"github.com/awslabs/operatorpkg/status"
+	"github.com/samber/lo"
 
 	operatorpkg "github.com/awslabs/operatorpkg/test/expectations"
 	. "github.com/onsi/ginkgo/v2"
@@ -32,6 +33,8 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	nodeclaimlifecycle "sigs.k8s.io/karpenter/pkg/controllers/nodeclaim/lifecycle"
+	"sigs.k8s.io/karpenter/pkg/events"
+	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 )
@@ -448,5 +451,237 @@ var _ = Describe("Liveness", func() {
 		operatorpkg.ExpectStatusConditions(ctx, env.Client, 1*time.Minute, nodePool, status.Condition{Type: v1.ConditionTypeNodeRegistrationHealthy, Status: metav1.ConditionUnknown})
 		ExpectFinalizersRemoved(ctx, env.Client, nodeClaim)
 		ExpectNotFound(ctx, env.Client, nodeClaim)
+	})
+	Context("Initialization Timeout", func() {
+		var nodeClaim *v1.NodeClaim
+		var node *corev1.Node
+
+		BeforeEach(func() {
+			recorder.Reset()
+			metrics.NodeClaimsDisruptedTotal.Reset()
+		})
+
+		registerUninitialized := func(timeout string) {
+			nodeClaim = test.NodeClaim(v1.NodeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name},
+				},
+				Spec: v1.NodeClaimSpec{
+					StartupTaints:         []corev1.Taint{{Key: "custom-startup-taint", Effect: corev1.TaintEffectNoSchedule}},
+					InitializationTimeout: v1.MustParseNillableDuration(timeout),
+				},
+			})
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim)
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+			node = test.NodeClaimLinkedNode(nodeClaim)
+			ExpectApplied(ctx, env.Client, node)
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+			Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeRegistered).IsTrue()).To(BeTrue())
+			Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized).Reason).To(Equal("StartupTaintsExist"))
+		}
+
+		It("should delete the NodeClaim when the node hasn't initialized past the initialization timeout", func() {
+			registerUninitialized("30m")
+			env.Clock.Step(31 * time.Minute)
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			ExpectFinalizersRemoved(ctx, env.Client, nodeClaim)
+			ExpectNotFound(ctx, env.Client, nodeClaim)
+			Expect(recorder.Calls(events.InitializationTimeout)).To(Equal(1))
+			ExpectMetricCounterValue(metrics.NodeClaimsDisruptedTotal, 1, map[string]string{
+				metrics.ReasonLabel:   metrics.InitializationTimeoutReason,
+				metrics.NodePoolLabel: nodePool.Name,
+			})
+		})
+		It("should requeue and not delete the NodeClaim before the initialization timeout", func() {
+			registerUninitialized("30m")
+			env.Clock.Step(20 * time.Minute)
+			result := ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			Expect(result.RequeueAfter).To(BeNumerically("~", 10*time.Minute, time.Minute))
+			ExpectExists(ctx, env.Client, nodeClaim)
+		})
+		It("should not delete an uninitialized NodeClaim when the initialization timeout is Never", func() {
+			registerUninitialized("Never")
+			env.Clock.Step(24 * time.Hour)
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			ExpectExists(ctx, env.Client, nodeClaim)
+			Expect(recorder.Calls(events.InitializationTimeout)).To(Equal(0))
+		})
+		It("should not delete an initialized NodeClaim past the initialization timeout", func() {
+			registerUninitialized("30m")
+			node = ExpectExists(ctx, env.Client, node)
+			node.Spec.Taints = nil
+			ExpectApplied(ctx, env.Client, node)
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+			Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized).IsTrue()).To(BeTrue())
+			env.Clock.Step(time.Hour)
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			ExpectExists(ctx, env.Client, nodeClaim)
+		})
+		It("should not delete a NodeClaim while it is rebooting", func() {
+			registerUninitialized("30m")
+			nodeClaim.StatusConditions().SetTrueWithReason(v1.ConditionTypeRebooting, v1.RebootReasonIssued, "")
+			ExpectApplied(ctx, env.Client, nodeClaim)
+			env.Clock.Step(time.Hour)
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			ExpectExists(ctx, env.Client, nodeClaim)
+		})
+		It("should measure the initialization timeout from the end of a reboot", func() {
+			registerUninitialized("30m")
+			env.Clock.Step(time.Hour)
+			nodeClaim.StatusConditions(status.WithClock(env.Clock)).SetFalse(v1.ConditionTypeRebooting, v1.RebootReasonSucceeded, "")
+			ExpectApplied(ctx, env.Client, nodeClaim)
+			env.Clock.Step(20 * time.Minute)
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			ExpectExists(ctx, env.Client, nodeClaim)
+			env.Clock.Step(11 * time.Minute)
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			ExpectFinalizersRemoved(ctx, env.Client, nodeClaim)
+			ExpectNotFound(ctx, env.Client, nodeClaim)
+		})
+		It("should requeue for the time remaining", func() {
+			registerUninitialized("30m")
+			env.Clock.Step(12 * time.Minute)
+			result := ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			Expect(result.RequeueAfter).To(BeNumerically("~", 18*time.Minute, 5*time.Second))
+		})
+		It("should report the last Initialized reason in the event", func() {
+			registerUninitialized("30m")
+			env.Clock.Step(31 * time.Minute)
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			Expect(recorder.Events()).To(ContainElement(HaveField("Message", And(
+				ContainSubstring("Node did not initialize within 30m0s"),
+				ContainSubstring("StartupTaintsExist"),
+			))))
+		})
+		It("should delete a never-initialized NodeClaim whose reboot is still draining", func() {
+			registerUninitialized("30m")
+			nodeClaim.StatusConditions(status.WithClock(env.Clock)).SetTrueWithReason(v1.ConditionTypeRebooting, v1.RebootReasonRequested, "")
+			ExpectApplied(ctx, env.Client, nodeClaim)
+			env.Clock.Step(31 * time.Minute)
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			ExpectFinalizersRemoved(ctx, env.Client, nodeClaim)
+			ExpectNotFound(ctx, env.Client, nodeClaim)
+			ExpectMetricCounterValue(metrics.NodeClaimsDisruptedTotal, 1, map[string]string{
+				metrics.ReasonLabel:   metrics.InitializationTimeoutReason,
+				metrics.NodePoolLabel: nodePool.Name,
+			})
+		})
+		It("should not restart the clock when a reboot request fails without rebooting", func() {
+			registerUninitialized("30m")
+			env.Clock.Step(20 * time.Minute)
+			nodeClaim.StatusConditions(status.WithClock(env.Clock)).SetFalse(v1.ConditionTypeRebooting, v1.RebootReasonFailed, "invalid reboot request")
+			ExpectApplied(ctx, env.Client, nodeClaim)
+			env.Clock.Step(11 * time.Minute)
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			ExpectFinalizersRemoved(ctx, env.Client, nodeClaim)
+			ExpectNotFound(ctx, env.Client, nodeClaim)
+		})
+		Context("Reboot", func() {
+			rebootInitializedNode := func() {
+				registerUninitialized("30m")
+				node = ExpectExists(ctx, env.Client, node)
+				node.Spec.Taints = nil
+				ExpectApplied(ctx, env.Client, node)
+				ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+				nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+				Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized).IsTrue()).To(BeTrue())
+				env.Clock.Step(48 * time.Hour)
+				nodeClaim.StatusConditions(status.WithClock(env.Clock)).SetTrueWithReason(v1.ConditionTypeRebooting, v1.RebootReasonIssued, "")
+				nodeClaim.StatusConditions(status.WithClock(env.Clock)).SetUnknownWithReason(v1.ConditionTypeInitialized, "Rebooting", "")
+				ExpectApplied(ctx, env.Client, nodeClaim)
+				node.Spec.Taints = []corev1.Taint{{Key: "custom-startup-taint", Effect: corev1.TaintEffectNoSchedule}}
+				ExpectApplied(ctx, env.Client, node)
+			}
+			succeed := func() {
+				nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+				nodeClaim.StatusConditions(status.WithClock(env.Clock)).SetFalse(v1.ConditionTypeRebooting, v1.RebootReasonSucceeded, "")
+				ExpectApplied(ctx, env.Client, nodeClaim)
+			}
+			It("should report a re-initialization timeout when the reboot succeeds in the second the node registered", func() {
+				registerUninitialized("30m")
+				nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+				nodeClaim.StatusConditions().SetFalse(v1.ConditionTypeRebooting, v1.RebootReasonSucceeded, "")
+				conditions := nodeClaim.GetConditions()
+				for i := range conditions {
+					if conditions[i].Type == v1.ConditionTypeRebooting {
+						conditions[i].LastTransitionTime = nodeClaim.StatusConditions().Get(v1.ConditionTypeRegistered).LastTransitionTime
+					}
+				}
+				nodeClaim.SetConditions(conditions)
+				ExpectApplied(ctx, env.Client, nodeClaim)
+				env.Clock.Step(31 * time.Minute)
+				ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+				ExpectFinalizersRemoved(ctx, env.Client, nodeClaim)
+				ExpectNotFound(ctx, env.Client, nodeClaim)
+				ExpectMetricCounterValue(metrics.NodeClaimsDisruptedTotal, 1, map[string]string{
+					metrics.ReasonLabel:   metrics.ReinitializationTimeoutReason,
+					metrics.NodePoolLabel: nodePool.Name,
+				})
+			})
+			It("should not delete while the reboot is issued", func() {
+				rebootInitializedNode()
+				env.Clock.Step(time.Hour)
+				ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+				ExpectExists(ctx, env.Client, nodeClaim)
+			})
+			It("should delete a NodeClaim that doesn't re-initialize within the timeout of the reboot succeeding", func() {
+				rebootInitializedNode()
+				env.Clock.Step(15 * time.Minute)
+				succeed()
+				env.Clock.Step(29 * time.Minute)
+				ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+				ExpectExists(ctx, env.Client, nodeClaim)
+				env.Clock.Step(2 * time.Minute)
+				ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+				ExpectFinalizersRemoved(ctx, env.Client, nodeClaim)
+				ExpectNotFound(ctx, env.Client, nodeClaim)
+				ExpectMetricCounterValue(metrics.NodeClaimsDisruptedTotal, 1, map[string]string{
+					metrics.ReasonLabel:   metrics.ReinitializationTimeoutReason,
+					metrics.NodePoolLabel: nodePool.Name,
+				})
+				Expect(recorder.Events()).To(ContainElement(HaveField("Message", ContainSubstring("Node did not re-initialize after reboot within 30m0s"))))
+			})
+			It("should not delete a NodeClaim that re-initializes after the reboot", func() {
+				rebootInitializedNode()
+				succeed()
+				node = ExpectExists(ctx, env.Client, node)
+				node.Spec.Taints = nil
+				ExpectApplied(ctx, env.Client, node)
+				ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+				nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+				Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized).IsTrue()).To(BeTrue())
+				env.Clock.Step(time.Hour)
+				ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+				ExpectExists(ctx, env.Client, nodeClaim)
+			})
+			It("should bound the drain by the reboot's termination grace period", func() {
+				rebootInitializedNode()
+				nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+				nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{v1.RebootTerminationGracePeriodAnnotationKey: "10m"})
+				nodeClaim.Finalizers = append(nodeClaim.Finalizers, "test.karpenter.sh/hold")
+				ExpectApplied(ctx, env.Client, nodeClaim)
+				succeed()
+				env.Clock.Step(31 * time.Minute)
+				ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+				nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+				Expect(nodeClaim.DeletionTimestamp.IsZero()).To(BeFalse())
+				terminationTime, err := time.Parse(time.RFC3339, nodeClaim.Annotations[v1.NodeClaimTerminationTimestampAnnotationKey])
+				Expect(err).ToNot(HaveOccurred())
+				Expect(terminationTime).To(BeTemporally("~", env.Clock.Now().Add(10*time.Minute), 5*time.Second))
+				ExpectFinalizersRemoved(ctx, env.Client, nodeClaim)
+			})
+		})
+		It("should propagate the initialization timeout from the NodePool template", func() {
+			nodePool.Spec.Template.Spec.InitializationTimeout = v1.MustParseNillableDuration("45m")
+			Expect(nodePool.Spec.Template.ToNodeClaim().Spec.InitializationTimeout.Duration).To(Equal(lo.ToPtr(45 * time.Minute)))
+		})
+		It("should not drift NodeClaims when the initialization timeout changes", func() {
+			hash := nodePool.Hash()
+			nodePool.Spec.Template.Spec.InitializationTimeout = v1.MustParseNillableDuration("45m")
+			Expect(nodePool.Hash()).To(Equal(hash))
+		})
 	})
 })

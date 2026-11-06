@@ -157,7 +157,7 @@ func (c *Controller) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (re
 // reconcileRequested applies the scheduling fence, drains, then issues the provider reboot.
 func (c *Controller) reconcileRequested(ctx context.Context, nodeClaim *v1.NodeClaim, node *corev1.Node) (reconcile.Result, error) {
 	// Invalid or negative termination grace periods fail the reboot; absent means unbounded drain.
-	tgp, err := rebootTerminationGracePeriod(nodeClaim)
+	tgp, err := nodeclaimutils.RebootTerminationGracePeriod(nodeClaim)
 	if err != nil {
 		return c.transitionToFailed(ctx, nodeClaim, node, resultInvalidRequest, fmt.Sprintf("invalid reboot request: %v", err))
 	}
@@ -355,7 +355,7 @@ func (c *Controller) transitionToFailed(ctx context.Context, nodeClaim *v1.NodeC
 	} else {
 		// Reboot failures after disruption escalate to NodeClaim replacement.
 		// The replacement inherits the reboot's committed drain bound, so failure cleanup can't block indefinitely.
-		if tgp, err := rebootTerminationGracePeriod(nodeClaim); err == nil && tgp != nil {
+		if tgp, err := nodeclaimutils.RebootTerminationGracePeriod(nodeClaim); err == nil && tgp != nil {
 			if err := nodeclaimutils.TightenTerminationTimestampAnnotation(ctx, c.kubeClient, nodeClaim, c.clock.Now().Add(*tgp)); err != nil {
 				return reconcile.Result{}, client.IgnoreNotFound(err)
 			}
@@ -422,21 +422,6 @@ func (c *Controller) removeInitializedLabel(ctx context.Context, node *corev1.No
 }
 
 // Reads the reboot drain bound: absent = unbounded, 0 = forceful, >0 = graceful.
-func rebootTerminationGracePeriod(nodeClaim *v1.NodeClaim) (*time.Duration, error) {
-	value, ok := nodeClaim.Annotations[v1.RebootTerminationGracePeriodAnnotationKey]
-	if !ok {
-		return nil, nil
-	}
-	d, err := time.ParseDuration(value)
-	if err != nil {
-		return nil, fmt.Errorf("parsing reboot termination grace period %q: %w", value, err)
-	}
-	if d < 0 {
-		return nil, fmt.Errorf("reboot termination grace period must be non-negative, got %q", value)
-	}
-	return &d, nil
-}
-
 // Derives reboot issuance time from Initialized transitioning to Unknown.
 func (c *Controller) issuedAt(nodeClaim *v1.NodeClaim) (time.Time, bool) {
 	cond := nodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized)
