@@ -18,6 +18,7 @@ package lifecycle
 
 import (
 	"fmt"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/util/flowcontrol"
@@ -68,6 +69,20 @@ func RebootDepartingPodsTerminatingEvent(nodeClaim *v1.NodeClaim, pod *corev1.Po
 		Reason:         events.RebootDepartingPodsTerminating,
 		Message:        fmt.Sprintf("Waiting to re-initialize after reboot until pod %s/%s, deleted before the reboot, finishes terminating", pod.Namespace, pod.Name),
 		DedupeValues:   []string{string(nodeClaim.UID), string(pod.UID)},
+	}
+}
+
+func InitializationTimeoutEvent(nodeClaim *v1.NodeClaim, timeout time.Duration, rebooted bool, reason, message string) events.Event {
+	phase := "initialize"
+	if rebooted {
+		phase = "re-initialize after reboot"
+	}
+	return events.Event{
+		InvolvedObject: nodeClaim,
+		Type:           corev1.EventTypeWarning,
+		Reason:         events.InitializationTimeout,
+		Message:        truncateMessage(fmt.Sprintf("Node did not %s within %s, replacing NodeClaim (last reason %s: %s)", phase, timeout, reason, message)),
+		DedupeValues:   []string{string(nodeClaim.UID)},
 	}
 }
 

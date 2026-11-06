@@ -284,6 +284,33 @@ var _ = Describe("Initialization", func() {
 		ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
 		Expect(ExpectExists(ctx, env.Client, nodeClaim).StatusConditions().Get(v1.ConditionTypeInitialized).IsTrue()).To(BeTrue())
 	})
+	It("should replace a rebooted node whose departing pods outlast the initialization timeout", func() {
+		nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{
+			ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name}},
+			Spec:       v1.NodeClaimSpec{InitializationTimeout: v1.MustParseNillableDuration("30m")},
+		})
+		nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeLaunched)
+		nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeRegistered)
+		pod := test.Pod(test.PodOptions{NodeName: node.Name, Phase: corev1.PodRunning})
+		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node, pod)
+		ExpectMakeNodesReady(ctx, env.Client, env.Clock, node)
+		ExpectRebootSucceeded(ctx, env.Client, env.Clock, nodeClaim, node)
+		ExpectDeletionTimestampSet(ctx, env.Client, pod)
+
+		ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+		Expect(ExpectExists(ctx, env.Client, nodeClaim).StatusConditions().Get(v1.ConditionTypeInitialized).Reason).To(Equal("RebootDepartingPodsTerminating"))
+		env.Clock.Step(29 * time.Minute)
+		ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+		Expect(ExpectExists(ctx, env.Client, nodeClaim).DeletionTimestamp.IsZero()).To(BeTrue())
+		env.Clock.Step(2 * time.Minute)
+		ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+		ExpectFinalizersRemoved(ctx, env.Client, nodeClaim)
+		ExpectNotFound(ctx, env.Client, nodeClaim)
+		Expect(recorder.Events()).To(ContainElement(HaveField("Message", And(
+			ContainSubstring("Node did not re-initialize after reboot within 30m0s"),
+			ContainSubstring("RebootDepartingPodsTerminating"),
+		))))
+	})
 	It("should not consider the Node to be initialized when the status of the Node is NotReady", func() {
 		nodeClaim := test.NodeClaim(v1.NodeClaim{
 			ObjectMeta: metav1.ObjectMeta{

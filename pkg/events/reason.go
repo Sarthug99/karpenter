@@ -55,6 +55,7 @@ const (
 	UnregisteredTaintMissing       = "UnregisteredTaintMissing"
 	RebootDepartingPodsTerminating = "RebootDepartingPodsTerminating"
 	NodeClassNotReady              = "NodeClassNotReady"
+	InitializationTimeout          = "InitializationTimeout"
 
 	// state/informer/vpa
 	PredictionTargetUnsupported = "PredictionTargetUnsupported"

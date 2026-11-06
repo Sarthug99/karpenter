@@ -34,17 +34,19 @@ var BoolValues = []opmetrics.Value{{Name: strconv.FormatBool(true)}, {Name: strc
 // applies to more than one reason Label is declared once here and referenced by
 // each Label that emits it.
 var (
-	reasonProvisioned          = opmetrics.Value{Name: ProvisionedReason, Help: "Capacity was provisioned for pending pods."}
-	reasonExpired              = opmetrics.Value{Name: ExpiredReason, Help: "The Node exceeded its expiration."}
-	reasonUnhealthy            = opmetrics.Value{Name: UnhealthyReason, Help: "The node failed a node-repair health check."}
-	reasonGarbageCollected     = opmetrics.Value{Name: GarbageCollectedReason, Help: "The NodeClaim's backing instance was gone and it was garbage collected."}
-	reasonInsufficientCapacity = opmetrics.Value{Name: InsufficientCapacityReason, Help: "The cloud provider had insufficient capacity to launch the NodeClaim."}
-	reasonNodeClassNotReady    = opmetrics.Value{Name: NodeClassNotReadyReason, Help: "The NodeClaim's NodeClass was not ready."}
-	reasonRegistrationTimeout  = opmetrics.Value{Name: RegistrationTimeoutReason, Help: "The NodeClaim's node did not register within the liveness timeout."}
-	reasonLaunchTimeout        = opmetrics.Value{Name: LaunchTimeoutReason, Help: "The NodeClaim's backing instance did not launch within the liveness timeout."}
-	reasonUnderutilized        = opmetrics.Value{Name: strings.ToLower(string(v1.DisruptionReasonUnderutilized)), Help: "The node was underutilized."}
-	reasonEmpty                = opmetrics.Value{Name: strings.ToLower(string(v1.DisruptionReasonEmpty)), Help: "The node had no workload pods."}
-	reasonDrifted              = opmetrics.Value{Name: strings.ToLower(string(v1.DisruptionReasonDrifted)), Help: "The node drifted from its desired specification."}
+	reasonProvisioned             = opmetrics.Value{Name: ProvisionedReason, Help: "Capacity was provisioned for pending pods."}
+	reasonExpired                 = opmetrics.Value{Name: ExpiredReason, Help: "The Node exceeded its expiration."}
+	reasonUnhealthy               = opmetrics.Value{Name: UnhealthyReason, Help: "The node failed a node-repair health check."}
+	reasonGarbageCollected        = opmetrics.Value{Name: GarbageCollectedReason, Help: "The NodeClaim's backing instance was gone and it was garbage collected."}
+	reasonInsufficientCapacity    = opmetrics.Value{Name: InsufficientCapacityReason, Help: "The cloud provider had insufficient capacity to launch the NodeClaim."}
+	reasonNodeClassNotReady       = opmetrics.Value{Name: NodeClassNotReadyReason, Help: "The NodeClaim's NodeClass was not ready."}
+	reasonRegistrationTimeout     = opmetrics.Value{Name: RegistrationTimeoutReason, Help: "The NodeClaim's node did not register within the liveness timeout."}
+	reasonLaunchTimeout           = opmetrics.Value{Name: LaunchTimeoutReason, Help: "The NodeClaim's backing instance did not launch within the liveness timeout."}
+	reasonInitializationTimeout   = opmetrics.Value{Name: InitializationTimeoutReason, Help: "The NodeClaim's node did not initialize within the NodeClaim's initializationTimeout."}
+	reasonReinitializationTimeout = opmetrics.Value{Name: ReinitializationTimeoutReason, Help: "The NodeClaim's node did not re-initialize within the NodeClaim's initializationTimeout after a reboot."}
+	reasonUnderutilized           = opmetrics.Value{Name: strings.ToLower(string(v1.DisruptionReasonUnderutilized)), Help: "The node was underutilized."}
+	reasonEmpty                   = opmetrics.Value{Name: strings.ToLower(string(v1.DisruptionReasonEmpty)), Help: "The node had no workload pods."}
+	reasonDrifted                 = opmetrics.Value{Name: strings.ToLower(string(v1.DisruptionReasonDrifted)), Help: "The node drifted from its desired specification."}
 )
 
 // disruptionReasonValues are the voluntary-disruption reasons, shared by the
@@ -61,6 +63,8 @@ var nodeClaimDisruptedReasonValues = []opmetrics.Value{
 	reasonNodeClassNotReady,
 	reasonRegistrationTimeout,
 	reasonLaunchTimeout,
+	reasonInitializationTimeout,
+	reasonReinitializationTimeout,
 	reasonUnderutilized,
 	reasonEmpty,
 	reasonDrifted,
