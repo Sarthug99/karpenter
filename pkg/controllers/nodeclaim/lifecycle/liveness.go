@@ -36,6 +36,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/state/nodepoolhealth"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
@@ -44,6 +45,7 @@ import (
 type Liveness struct {
 	clock      clock.Clock
 	kubeClient client.Client
+	recorder   events.Recorder
 	npState    *nodepoolhealth.State
 }
 
@@ -53,8 +55,10 @@ type Liveness struct {
 const (
 	registrationTimeout = time.Minute * 15
 	// Sourced from pkg/metrics so the documented reason values stay in one place.
-	registrationTimeoutReason = metrics.RegistrationTimeoutReason
-	launchTimeoutReason       = metrics.LaunchTimeoutReason
+	registrationTimeoutReason     = metrics.RegistrationTimeoutReason
+	launchTimeoutReason           = metrics.LaunchTimeoutReason
+	initializationTimeoutReason   = metrics.InitializationTimeoutReason
+	reinitializationTimeoutReason = metrics.ReinitializationTimeoutReason
 )
 
 // LaunchTimeout is a heuristic time that we expect to be able to launch within
@@ -64,7 +68,7 @@ var LaunchTimeout = time.Minute * 5
 func (l *Liveness) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconcile.Result, error) {
 	registered := nodeClaim.StatusConditions().Get(v1.ConditionTypeRegistered)
 	if registered.IsTrue() {
-		return reconcile.Result{}, nil
+		return l.reconcileInitializationTimeout(ctx, nodeClaim)
 	}
 	launched := nodeClaim.StatusConditions().Get(v1.ConditionTypeLaunched)
 	if launched == nil {
@@ -110,6 +114,47 @@ func (l *Liveness) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reco
 		return reconcile.Result{}, nil
 	}
 	return reconcile.Result{}, nil
+}
+
+func (l *Liveness) reconcileInitializationTimeout(ctx context.Context, nodeClaim *v1.NodeClaim) (reconcile.Result, error) {
+	timeout := nodeClaim.Spec.InitializationTimeout.Duration
+	if timeout == nil {
+		return reconcile.Result{}, nil
+	}
+	initialized := nodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized)
+	if initialized == nil || initialized.IsTrue() {
+		return reconcile.Result{}, nil
+	}
+	rebooting := nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting)
+	if rebooting.IsTrue() && rebooting.Reason == v1.RebootReasonIssued {
+		return reconcile.Result{}, nil
+	}
+	startedAt, rebooted := initializationStartedAt(nodeClaim)
+	if timeUntilTimeout := *timeout - l.clock.Since(startedAt); timeUntilTimeout > 0 {
+		return reconcile.Result{RequeueAfter: timeUntilTimeout}, nil
+	}
+	reason := initializationTimeoutReason
+	if rebooted {
+		reason = reinitializationTimeoutReason
+		if tgp, err := nodeclaimutils.RebootTerminationGracePeriod(nodeClaim); err == nil && tgp != nil {
+			if err := nodeclaimutils.TightenTerminationTimestampAnnotation(ctx, l.kubeClient, nodeClaim, l.clock.Now().Add(*tgp)); err != nil {
+				return reconcile.Result{}, client.IgnoreNotFound(err)
+			}
+		}
+	}
+	if err := l.deleteNodeClaimForTimeout(ctx, *timeout, reason, nodeClaim); err != nil {
+		return reconcile.Result{}, client.IgnoreNotFound(err)
+	}
+	l.recorder.Publish(InitializationTimeoutEvent(nodeClaim, *timeout, rebooted, initialized.Reason, initialized.Message))
+	return reconcile.Result{}, nil
+}
+
+func initializationStartedAt(nodeClaim *v1.NodeClaim) (time.Time, bool) {
+	started := nodeClaim.StatusConditions().Get(v1.ConditionTypeRegistered).LastTransitionTime.Time
+	if rebooting := nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting); rebooting.IsFalse() && rebooting.Reason == v1.RebootReasonSucceeded {
+		return lo.Latest(started, rebooting.LastTransitionTime.Time), true
+	}
+	return started, false
 }
 
 // updateNodePoolRegistrationHealth sets the NodeRegistrationHealthy=False

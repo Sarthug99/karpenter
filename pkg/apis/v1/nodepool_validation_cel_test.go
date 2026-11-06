@@ -97,6 +97,32 @@ var _ = Describe("CEL/Validation", func() {
 			Entry("invalid unit", "1hr"),
 			Entry("partial match", "FooNever"),
 		)
+		DescribeTable("should succeed on a valid initializationTimeout", func(value string) {
+			u := lo.Must(runtime.DefaultUnstructuredConverter.ToUnstructured(nodePool))
+			lo.Must0(unstructured.SetNestedField(u, value, "spec", "template", "spec", "initializationTimeout"))
+			obj := &unstructured.Unstructured{}
+			obj.SetGroupVersionKind(nodePool.GroupVersionKind())
+			lo.Must0(runtime.DefaultUnstructuredConverter.FromUnstructured(u, obj))
+
+			Expect(env.Client.Create(ctx, obj)).To(Succeed())
+		},
+			Entry("minimum", "1m"),
+			Entry("multiple units", "1h30m5s"),
+			Entry("never", "Never"),
+		)
+		DescribeTable("should fail on an invalid initializationTimeout", func(value string) {
+			u := lo.Must(runtime.DefaultUnstructuredConverter.ToUnstructured(nodePool))
+			lo.Must0(unstructured.SetNestedField(u, value, "spec", "template", "spec", "initializationTimeout"))
+			obj := &unstructured.Unstructured{}
+			obj.SetGroupVersionKind(nodePool.GroupVersionKind())
+			lo.Must0(runtime.DefaultUnstructuredConverter.FromUnstructured(u, obj))
+
+			Expect(env.Client.Create(ctx, obj)).To(Not(Succeed()))
+		},
+			Entry("zero", "0s"),
+			Entry("below the minimum", "59s"),
+			Entry("invalid unit", "1hr"),
+		)
 		It("should succeed on a disabled consolidateAfter", func() {
 			nodePool.Spec.Disruption.ConsolidateAfter = MustParseNillableDuration("Never")
 			Expect(env.Client.Create(ctx, nodePool)).To(Succeed())

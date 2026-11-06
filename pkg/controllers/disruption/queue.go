@@ -211,6 +211,9 @@ func (q *Queue) waitOrTerminate(ctx context.Context, cmd *Command) (err error) {
 			waitErrs[i] = fmt.Errorf("getting node claim, %w", err)
 			continue
 		}
+		if !nodeClaim.DeletionTimestamp.IsZero() {
+			return NewUnrecoverableError(serrors.Wrap(fmt.Errorf("replacement is being deleted"), "NodeClaim", klog.KObj(nodeClaim)))
+		}
 		// We emitted this event when disruption was blocked on launching/termination.
 		// This does not block other forms of deprovisioning, but we should still emit this.
 		q.recorder.Publish(disruptionevents.Launching(nodeClaim, string(cmd.Reason())))
