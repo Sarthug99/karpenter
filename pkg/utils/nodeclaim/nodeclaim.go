@@ -294,3 +294,18 @@ func UpdateNodeOwnerReferences(nodeClaim *v1.NodeClaim, node *corev1.Node) *core
 	})
 	return node
 }
+
+func RebootTerminationGracePeriod(nodeClaim *v1.NodeClaim) (*time.Duration, error) {
+	value, ok := nodeClaim.Annotations[v1.RebootTerminationGracePeriodAnnotationKey]
+	if !ok {
+		return nil, nil
+	}
+	d, err := time.ParseDuration(value)
+	if err != nil {
+		return nil, fmt.Errorf("parsing reboot termination grace period %q: %w", value, err)
+	}
+	if d < 0 {
+		return nil, fmt.Errorf("reboot termination grace period must be non-negative, got %q", value)
+	}
+	return &d, nil
+}

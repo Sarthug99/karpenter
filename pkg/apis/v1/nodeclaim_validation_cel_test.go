@@ -316,4 +316,33 @@ var _ = Describe("Validation", func() {
 			Entry("partial match", "FooNever"),
 		)
 	})
+	Context("InitializationTimeout", func() {
+		DescribeTable("should succeed on a valid initializationTimeout", func(value string) {
+			u := lo.Must(runtime.DefaultUnstructuredConverter.ToUnstructured(nodeClaim))
+			lo.Must0(unstructured.SetNestedField(u, value, "spec", "initializationTimeout"))
+			obj := &unstructured.Unstructured{}
+			lo.Must0(runtime.DefaultUnstructuredConverter.FromUnstructured(u, obj))
+
+			Expect(env.Client.Create(ctx, obj)).To(Succeed())
+		},
+			Entry("minimum", "1m"),
+			Entry("seconds at the minimum", "60s"),
+			Entry("multiple units", "1h30m5s"),
+			Entry("never", "Never"),
+		)
+		DescribeTable("should fail on an invalid initializationTimeout", func(value string) {
+			u := lo.Must(runtime.DefaultUnstructuredConverter.ToUnstructured(nodeClaim))
+			lo.Must0(unstructured.SetNestedField(u, value, "spec", "initializationTimeout"))
+			obj := &unstructured.Unstructured{}
+			lo.Must0(runtime.DefaultUnstructuredConverter.FromUnstructured(u, obj))
+
+			Expect(env.Client.Create(ctx, obj)).To(Not(Succeed()))
+		},
+			Entry("zero", "0s"),
+			Entry("below the minimum", "59s"),
+			Entry("negative", "-1s"),
+			Entry("invalid unit", "1hr"),
+			Entry("partial match", "FooNever"),
+		)
+	})
 })
